@@ -1,171 +1,117 @@
-name: RDP
-
-on:
-  workflow_dispatch:
-
-jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
-
-    steps:
-      - name: Configure Core RDP Settings
+      - name: Verify RDP Accessibility
         shell: pwsh
         run: |
-          # Require admin
-          $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          if (-not $isAdmin) {
-            Write-Error "This step requires Administrator privileges."
+          Write-Host "=== Verifying RDP Accessibility ==="
+          
+          # Check if RDP service is running
+          $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+          if ($rdpService.Status -ne 'Running') {
+            Write-Error "RDP Service (TermService) is not running. Current status: $($rdpService.Status)"
             exit 1
           }
+          Write-Host "✓ RDP Service is running"
 
-          # Backup current values (optional)
-          $backup = @{
-            fDenyTSConnections = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections
-            UserAuthentication = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -ErrorAction SilentlyContinue).UserAuthentication
-            SecurityLayer      = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -ErrorAction SilentlyContinue).SecurityLayer
+          # Verify RDP registry settings
+          $fDenyTS = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections
+          if ($fDenyTS -ne 0) {
+            Write-Error "Remote Desktop is disabled (fDenyTSConnections=$fDenyTS). Expected 0."
+            exit 1
           }
-          $backupFile = Join-Path $env:RUNNER_TEMP 'rdp_registry_backup.json'
-          $backup | ConvertTo-Json | Out-File -FilePath $backupFile -Encoding utf8
+          Write-Host "✓ Remote Desktop is enabled (fDenyTSConnections=0)"
 
-          # Enable Remote Desktop (fDenyTSConnections = 0)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          # Check if RDP user exists and is enabled
+          $rdpUser = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          if (-not $rdpUser) {
+            Write-Error "RDP user account does not exist"
+            exit 1
+          }
+          if ($rdpUser.Enabled -eq $false) {
+            Write-Error "RDP user account is disabled"
+            exit 1
+          }
+          Write-Host "✓ RDP user account exists and is enabled"
 
-          # Recommended: Require Network Level Authentication (UserAuthentication = 1) and use SecurityLayer = 2 (TLS)
-          # If you must disable NLA for compatibility, set UserAuthentication = 0 and SecurityLayer = 0 (less secure).
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 2 -Force
+          # Verify RDP user is in Remote Desktop Users group
+          $rdpGroup = Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*RDP' }
+          if (-not $rdpGroup) {
+            Write-Error "RDP user is not a member of Remote Desktop Users group"
+            exit 1
+          }
+          Write-Host "✓ RDP user is in Remote Desktop Users group"
 
-          # Remove any existing firewall rule with the same name (ignore errors)
+          # Check firewall rule
+          $fwRule = netsh advfirewall firewall show rule name="RDP-Tailscale" 2>$null | Select-String "Status"
+          if (-not $fwRule) {
+            Write-Error "RDP firewall rule 'RDP-Tailscale' not found"
+            exit 1
+          }
+          Write-Host "✓ RDP firewall rule is configured"
+
+          # Verify Tailscale connectivity
+          $tsIP = $env:TAILSCALE_IP
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            Write-Error "Tailscale IP is not set"
+            exit 1
+          }
+          Write-Host "✓ Tailscale IP is configured: $tsIP"
+
+          # Test RDP port connectivity on localhost
           try {
-            netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          } catch {
-            Write-Host "No previous RDP-Tailscale rule to delete or deletion failed (continuing)."
-          }
-
-          # Create firewall rule allowing inbound TCP 3389; consider restricting RemoteIP to Tailscale ranges later
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          # Restart Remote Desktop service to apply changes
-          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
-
-          Write-Host "RDP configured. Backup saved to: $backupFile"
-
-      - name: Create RDP User with Secure Password
-        id: create_user
-        shell: pwsh
-        run: |
-          # Generate a strong password
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-
-          # Create secure string and user (only if not exists)
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          $username = 'RDP'
-
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -Description "Temporary RDP user for GitHub Actions job" -UserMayNotChangePassword:$false -ErrorAction Stop
-            Write-Host "Local user '$username' created."
-          } else {
-            Write-Host "Local user '$username' already exists. Updating password."
-            $user = Get-LocalUser -Name $username
-            $user | Set-LocalUser -Password $securePass
-          }
-
-          # Add user to Remote Desktop Users (not Administrators by default)
-          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username -ErrorAction SilentlyContinue
-
-          # Verify creation
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            Write-Error "User creation failed"
-            exit 1
-          }
-
-          # Save credentials to a file in RUNNER_TEMP and output path for the next step to upload as artifact.
-          $credsFile = Join-Path $env:RUNNER_TEMP 'rdp_creds.txt'
-          "User: $username`nPassword: $password" | Out-File -FilePath $credsFile -Encoding utf8
-          Write-Host "CREDS_FILE=$credsFile"  # visible in logs, path only (password file not printed)
-
-          # Export the path as step output for use by later steps
-          Write-Output "::set-output name=creds_path::$credsFile"
-
-      - name: Upload RDP credentials (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rdp-credentials
-          path: ${{ steps.create_user.outputs.creds_path }}
-          retention-days: 1
-
-      - name: Remove local creds file
-        if: always()
-        shell: pwsh
-        run: |
-          $path = '${{ steps.create_user.outputs.creds_path }}'
-          if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
-
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
-
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-
-      - name: Establish Tailscale Connection
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-            Write-Error "Missing TAILSCALE_AUTH_KEY secret."
-            exit 1
-          }
-
-          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          if (-not (Test-Path $tsExe)) {
-            Write-Error "tailscale.exe not found at $tsExe"
-            exit 1
-          }
-
-          # Start tailscale with authkey and a unique hostname
-          & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID" 2>$null
-
-          # Wait for an IPv4 address from Tailscale
-          $tsIP = $null
-          $retries = 0
-          while ((-not $tsIP) -and ($retries -lt 12)) {
-              $ipOut = & $tsExe ip -4 2>$null
-              if ($ipOut) {
-                  $tsIP = ($ipOut -split "\r?\n" | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1).Trim()
-              }
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+            $socket = New-Object System.Net.Sockets.TcpClient
+            $socket.Connect('127.0.0.1', 3389)
+            if ($socket.Connected) {
+              Write-Host "✓ RDP port 3389 is listening and accessible"
+              $socket.Close()
+            } else {
+              Write-Error "Could not connect to RDP port 3389"
               exit 1
+            }
+          } catch {
+            Write-Error "RDP port 3389 connection test failed: $_"
+            exit 1
           }
 
-          # Persist IP for later steps if needed
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Tailscale IP detected: $tsIP"
+          Write-Host "=== All RDP accessibility checks passed ==="
 
-      - name: Show connection info
+      - name: Maintain Connection (Keep-Alive)
         shell: pwsh
         run: |
-          Write-Host "RDP user created: RDP"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "=== Starting connection maintenance loop ==="
+          Write-Host "This job will remain active for monitoring and remote access."
+          Write-Host "You can now connect via RDP using the Tailscale IP provided above."
+          Write-Host ""
+          
+          # Keep the job alive by performing periodic checks
+          $maxWaitTime = 120  # minutes
+          $checkInterval = 60  # seconds
+          $elapsed = 0
+          
+          while ($elapsed -lt ($maxWaitTime * 60)) {
+            # Every 5 minutes, verify services are still running
+            if (($elapsed % 300) -eq 0) {
+              $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              $tsStatus = & "$(Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe')" status 2>$null | Select-String "yo@"
+              
+              if ($rdpService.Status -eq 'Running' -and $tsStatus) {
+                $currentTime = Get-Date -Format "HH:mm:ss"
+                Write-Host "[$currentTime] ✓ Services healthy - RDP and Tailscale are running"
+              } else {
+                Write-Host "Warning: Service status check detected an issue. Attempting recovery..."
+                if ($rdpService.Status -ne 'Running') {
+                  Start-Service -Name TermService -ErrorAction SilentlyContinue
+                }
+              }
+            }
+            
+            Start-Sleep -Seconds $checkInterval
+            $elapsed += $checkInterval
+            
+            # Optional: Display connection info every 30 seconds
+            if (($elapsed % 30) -eq 0) {
+              $remainingTime = [math]::Round(($maxWaitTime * 60 - $elapsed) / 60, 1)
+              Write-Host "Connection active. Time remaining: $remainingTime minutes"
+            }
+          }
+          
+          Write-Host "=== Connection maintenance window completed ==="
+          Write-Host "Keep this job open in GitHub Actions to maintain RDP access."
