@@ -4,150 +4,202 @@
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
 
           Write-Host "======================================"
           Write-Host "       ESTABLISH TAILSCALE"
           Write-Host "======================================"
 
+          # ✅ Validasi secret
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
             Write-Error "TAILSCALE_AUTH_KEY secret belum tersedia."
             exit 1
           }
 
-          # Cari tailscale.exe
-          $tsExe = $null
+          # ✅ Fungsi untuk logging dengan timestamp
+          function Write-LogHost {
+            param([string]$Message)
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$timestamp] $Message"
+          }
 
+          # ✅ Cari tailscale.exe dengan fallback yang lebih robust
+          $tsExe = $null
           $possiblePaths = @(
             "$env:ProgramFiles\Tailscale\tailscale.exe",
-            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe",
+            "$env:LOCALAPPDATA\Tailscale\tailscale.exe",
+            "C:\Tailscale\tailscale.exe"
           )
 
           foreach ($path in $possiblePaths) {
             if (Test-Path $path) {
               $tsExe = $path
+              Write-LogHost "Found Tailscale at: $tsExe"
               break
             }
           }
 
+          # ✅ Jika tidak ditemukan di path standar, cari di PATH environment
           if (-not $tsExe) {
-            $cmd = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-
-            if ($cmd) {
+            try {
+              $cmd = Get-Command tailscale.exe -ErrorAction Stop
               $tsExe = $cmd.Source
+              Write-LogHost "Found Tailscale in PATH: $tsExe"
+            }
+            catch {
+              Write-Error "tailscale.exe tidak ditemukan di path standar maupun PATH environment."
+              exit 1
             }
           }
 
-          if (-not $tsExe) {
-            Write-Error "tailscale.exe tidak ditemukan."
-            exit 1
-          }
+          Write-LogHost "Tailscale executable: $tsExe"
 
-          Write-Host "Tailscale executable: $tsExe"
-
-          # Pastikan daemon/service berjalan
+          # ✅ Pastikan daemon/service berjalan dengan error handling yang lebih baik
           $tsService = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
 
           if ($tsService) {
-            Write-Host "Tailscale service status: $($tsService.Status)"
+            Write-LogHost "Tailscale service status: $($tsService.Status)"
 
             if ($tsService.Status -ne "Running") {
-              Write-Host "Starting Tailscale service..."
-
-              Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-
-              Start-Sleep -Seconds 5
-
-              $tsService.Refresh()
-              Write-Host "Tailscale service status: $($tsService.Status)"
+              Write-LogHost "Starting Tailscale service..."
+              try {
+                Start-Service -Name Tailscale -ErrorAction Stop
+                Start-Sleep -Seconds 3
+                $tsService.Refresh()
+                Write-LogHost "Tailscale service started: $($tsService.Status)"
+              }
+              catch {
+                Write-Warning "Gagal memulai Tailscale service: $($_.Exception.Message)"
+              }
             }
           }
           else {
-            Write-Warning "Windows service Tailscale tidak ditemukan."
+            Write-Warning "Windows service Tailscale tidak ditemukan - melanjutkan dengan versi CLI saja."
           }
 
-          # Versi CLI
-          Write-Host ""
-          Write-Host "Tailscale version:"
-          & $tsExe version
-
-          # Login / connect
-          Write-Host ""
-          Write-Host "Connecting to Tailscale..."
-
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-
-          $upOutput = & $tsExe up `
-            "--authkey=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=$hostname" 2>&1
-
-          $upExitCode = $LASTEXITCODE
-
-          Write-Host "tailscale up exit code: $upExitCode"
-
-          if ($upOutput) {
-            $upOutput | ForEach-Object {
-              Write-Host $_
+          # ✅ Cek versi CLI dan pastikan executable valid
+          try {
+            Write-LogHost "Checking Tailscale version..."
+            $versionOutput = & $tsExe version 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Tailscale version check returned non-zero exit code: $LASTEXITCODE"
+            }
+            else {
+              Write-LogHost "Tailscale version: $versionOutput"
             }
           }
-
-          if ($upExitCode -ne 0) {
-            Write-Error "tailscale up gagal."
+          catch {
+            Write-Error "Gagal mengecek versi Tailscale: $($_.Exception.Message)"
             exit 1
           }
 
-          # Beri daemon waktu untuk menyelesaikan koneksi
-          Write-Host ""
-          Write-Host "Waiting for Tailscale connection..."
+          # ✅ Login/connect dengan retry logic yang lebih baik
+          Write-LogHost "Connecting to Tailscale..."
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          $connectRetries = 3
+          $connectAttempt = 0
+          $upExitCode = 1
 
-          $tsIP = $null
-          $maxRetries = 30
-
-          for ($i = 1; $i -le $maxRetries; $i++) {
-
-            Write-Host "Attempt $i/$maxRetries..."
+          while ($connectAttempt -lt $connectRetries -and $upExitCode -ne 0) {
+            $connectAttempt++
+            Write-LogHost "Tailscale up attempt $connectAttempt/$connectRetries..."
 
             try {
-              $ipOutput = & $tsExe ip -4 2>&1
+              $upOutput = & $tsExe up `
+                "--authkey=$env:TAILSCALE_AUTH_KEY" `
+                "--hostname=$hostname" 2>&1
 
-              if ($LASTEXITCODE -eq 0 -and $ipOutput) {
+              $upExitCode = $LASTEXITCODE
+              Write-LogHost "tailscale up exit code: $upExitCode"
 
-                foreach ($line in $ipOutput) {
+              if ($upOutput) {
+                $upOutput | ForEach-Object {
+                  Write-LogHost "  $_"
+                }
+              }
 
-                  $lineText = "$line".Trim()
-
-                  if ($lineText -match '^\s*(\d{1,3}\.){3}\d{1,3}\s*$') {
-                    $tsIP = $lineText
-                    break
-                  }
+              if ($upExitCode -ne 0) {
+                Write-Warning "tailscale up gagal pada attempt $connectAttempt"
+                if ($connectAttempt -lt $connectRetries) {
+                  Start-Sleep -Seconds 2
                 }
               }
             }
             catch {
-              Write-Host "IP query error: $($_.Exception.Message)"
+              Write-Warning "Error during tailscale up: $($_.Exception.Message)"
+              if ($connectAttempt -lt $connectRetries) {
+                Start-Sleep -Seconds 2
+              }
+            }
+          }
+
+          if ($upExitCode -ne 0) {
+            Write-Error "Gagal connect ke Tailscale setelah $connectRetries attempts."
+            exit 1
+          }
+
+          Write-LogHost "Tailscale up berhasil."
+
+          # ✅ Tunggu koneksi dengan timeout yang lebih intelligent
+          Write-LogHost "Waiting for Tailscale connection..."
+          $tsIP = $null
+          $maxRetries = 60
+          $retryInterval = 2
+
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            Write-LogHost "Attempt $i/$maxRetries untuk mendapatkan IP..."
+
+            try {
+              $ipOutput = & $tsExe ip -4 2>&1
+              $ipExitCode = $LASTEXITCODE
+
+              if ($ipExitCode -eq 0 -and $ipOutput) {
+                foreach ($line in $ipOutput) {
+                  $lineText = "$line".Trim()
+
+                  # ✅ Regex yang lebih akurat untuk IPv4
+                  if ($lineText -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                    $tsIP = $lineText
+                    Write-LogHost "Got Tailscale IP: $tsIP"
+                    break
+                  }
+                }
+              }
+              elseif ($ipExitCode -ne 0) {
+                Write-LogHost "tailscale ip -4 returned exit code: $ipExitCode"
+              }
+            }
+            catch {
+              Write-LogHost "IP query error: $($_.Exception.Message)"
             }
 
             if ($tsIP) {
               break
             }
 
-            # Tampilkan status untuk debugging
-            try {
-              $statusOutput = & $tsExe status 2>&1
-
-              if ($statusOutput) {
-                Write-Host "Tailscale status:"
-                $statusOutput | Select-Object -First 5 | ForEach-Object {
-                  Write-Host "  $_"
+            # ✅ Tampilkan status untuk debugging (tapi lebih ringkas)
+            if ($i % 5 -eq 0) {
+              try {
+                $statusOutput = & $tsExe status 2>&1
+                if ($statusOutput) {
+                  Write-LogHost "Tailscale status sample:"
+                  $statusOutput | Select-Object -First 3 | ForEach-Object {
+                    Write-LogHost "  $_"
+                  }
                 }
               }
-            }
-            catch {
-              Write-Host "Unable to read Tailscale status."
+              catch {
+                Write-LogHost "Unable to read Tailscale status (non-critical)"
+              }
             }
 
-            Start-Sleep -Seconds 5
+            if ($i -lt $maxRetries) {
+              Start-Sleep -Seconds $retryInterval
+            }
           }
 
+          # ✅ Debug info jika gagal dengan format yang lebih baik
           if (-not $tsIP) {
             Write-Host ""
             Write-Host "======================================"
@@ -155,33 +207,55 @@
             Write-Host "======================================"
 
             try {
+              Write-Host "Status:"
               & $tsExe status
             }
             catch {
-              Write-Host "status failed: $($_.Exception.Message)"
+              Write-Host "  status failed: $($_.Exception.Message)"
             }
 
             try {
+              Write-Host ""
+              Write-Host "Network check:"
               & $tsExe netcheck
             }
             catch {
-              Write-Host "netcheck failed: $($_.Exception.Message)"
+              Write-Host "  netcheck failed: $($_.Exception.Message)"
+            }
+
+            # ✅ Cek apakah ada proses tailscale yang berjalan
+            Write-Host ""
+            Write-Host "Running Tailscale processes:"
+            Get-Process -Name tailscale* -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "  $($_.Name) (PID: $($_.Id))"
             }
 
             Write-Host "======================================"
 
-            Write-Error "Tailscale IP tidak berhasil diperoleh."
+            Write-Error "Tailscale IP tidak berhasil diperoleh setelah $maxRetries attempts."
             exit 1
           }
 
-          # Simpan untuk step berikutnya
-          "TAILSCALE_IP=$tsIP" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Encoding utf8 `
-            -Append
+          # ✅ Simpan untuk step berikutnya dengan validasi
+          Write-LogHost "Saving TAILSCALE_IP to environment..."
+          $envContent = "TAILSCALE_IP=$tsIP"
+          
+          try {
+            $envContent | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append `
+              -ErrorAction Stop
+            Write-LogHost "Environment variable saved successfully."
+          }
+          catch {
+            Write-Error "Gagal menyimpan environment variable: $($_.Exception.Message)"
+            exit 1
+          }
 
           Write-Host ""
           Write-Host "======================================"
-          Write-Host "Tailscale connection established."
+          Write-Host "✅ Tailscale connection established"
           Write-Host "Tailscale IP: $tsIP"
+          Write-Host "Hostname: $hostname"
           Write-Host "======================================"
