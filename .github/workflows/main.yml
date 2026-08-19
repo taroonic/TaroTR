@@ -1,139 +1,83 @@
-name: RDP
+I'll help you find a solution for this failing job. Let me start by retrieving the job logs.Now let me get the workflow file to understand the full context:## Solution
 
-on:
-  workflow_dispatch:
+The job is failing because **Tailscale failed to assign an IP address within the timeout period**. The error occurs in the "Establish Tailscale Connection" step:
 
-jobs:
-  rdp-check:
-    runs-on: windows-latest
+```
+Write-Error: Tailscale IP not assigned. Exiting.
+```
 
-    steps:
-      - name: Check RDP Service
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
+### Root Cause
 
-          Write-Host "=== RDP SERVICE ==="
+The script waits up to 60 seconds (12 retries × 5 seconds) for Tailscale to assign an IPv4 address after running `tailscale up`. The connection failed to complete within this window, likely due to:
 
-          $service = Get-Service -Name TermService -ErrorAction SilentlyContinue
+1. **Tailscale service not starting properly** after installation
+2. **Network connectivity issues** on the runner
+3. **Auth key validation timeout** or failure
+4. **Insufficient wait time** for the Tailscale daemon to initialize
 
-          if (-not $service) {
-            Write-Error "TermService tidak ditemukan."
-            exit 1
+### Recommended Fix
+
+Update the "Establish Tailscale Connection" step in [`.github/workflows/main.yml`](https://github.com/taroonic/TaroTR/blob/575c7788372ae2a0c5ce216fe36ea865e5caa5c0/.github/workflows/main.yml) (lines 127-165):
+
+```powershell
+- name: Establish Tailscale Connection
+  shell: pwsh
+  env:
+    TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+  run: |
+    if (-not $env:TAILSCALE_AUTH_KEY) {
+      Write-Error "Missing TAILSCALE_AUTH_KEY secret."
+      exit 1
+    }
+
+    $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+    if (-not (Test-Path $tsExe)) {
+      Write-Error "tailscale.exe not found at $tsExe"
+      exit 1
+    }
+
+    # Start tailscale with authkey and a unique hostname
+    Write-Host "Starting Tailscale..."
+    & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID" 2>$null
+    
+    # Add initial wait for daemon to initialize
+    Start-Sleep -Seconds 10
+
+    # Wait for an IPv4 address from Tailscale (increased retries to 30 = 150 seconds)
+    $tsIP = $null
+    $retries = 0
+    while ((-not $tsIP) -and ($retries -lt 30)) {
+      try {
+        $ipOut = & $tsExe ip -4 2>$null
+        if ($ipOut) {
+          $tsIP = ($ipOut -split "\r?\n" | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1).Trim()
+          if ($tsIP) {
+            Write-Host "Tailscale IP detected on retry $retries : $tsIP"
+            break
           }
+        }
+      } catch {
+        Write-Host "Error querying Tailscale IP (retry $retries): $_"
+      }
+      Start-Sleep -Seconds 5
+      $retries++
+    }
 
-          Write-Host "Status: $($service.Status)"
+    if (-not $tsIP) {
+      Write-Error "Tailscale IP not assigned after $($retries * 5) seconds. Exiting."
+      exit 1
+    }
 
-          if ($service.Status -ne 'Running') {
-            Write-Error "RDP service tidak sedang berjalan."
-            exit 1
-          }
+    # Persist IP for later steps if needed
+    "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    Write-Host "Tailscale connection established. IP: $tsIP"
+```
 
-          Write-Host "RDP service OK."
+### Key Changes
 
-      - name: Check RDP Registry
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
+1. **Added 10-second initial delay** after `tailscale up` to allow daemon startup
+2. **Increased retry count from 12 to 30** (150 seconds total instead of 60)
+3. **Added error handling and logging** to debug IP query failures
+4. **Added success confirmation** in the loop to exit early when IP is found
 
-          Write-Host "=== RDP REGISTRY ==="
-
-          $path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
-
-          $reg = Get-ItemProperty `
-            -Path $path `
-            -Name fDenyTSConnections `
-            -ErrorAction Stop
-
-          Write-Host "fDenyTSConnections: $($reg.fDenyTSConnections)"
-
-          if ($reg.fDenyTSConnections -ne 0) {
-            Write-Error "RDP dinonaktifkan pada registry."
-            exit 1
-          }
-
-          Write-Host "RDP registry OK."
-
-      - name: Check RDP Port
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "=== RDP PORT 3389 ==="
-
-          $result = Test-NetConnection `
-            -ComputerName '127.0.0.1' `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
-
-          if (-not $result.TcpTestSucceeded) {
-            Write-Error "Port 3389 tidak dapat diakses."
-            exit 1
-          }
-
-          Write-Host "127.0.0.1:3389 OK."
-
-      - name: Check Tailscale
-        shell: pwsh
-        env:
-          TAILSCALE_IP: ${{ secrets.TAILSCALE_IP }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "=== TAILSCALE CHECK ==="
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_IP)) {
-            Write-Error "Secret TAILSCALE_IP belum dibuat."
-            exit 1
-          }
-
-          Write-Host "Testing Tailscale IP: $env:TAILSCALE_IP"
-
-          $result = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
-
-          if (-not $result.TcpTestSucceeded) {
-            Write-Error "TCP $env:TAILSCALE_IP`:3389 gagal."
-            exit 1
-          }
-
-          Write-Host "Tailscale RDP connectivity OK."
-
-      - name: Check Firewall
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          Write-Host "=== FIREWALL ==="
-
-          $rules = Get-NetFirewallRule -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.DisplayGroup -match 'Remote Desktop' -and
-              $_.Enabled -eq 'True'
-            }
-
-          if ($rules) {
-            Write-Host "Remote Desktop firewall rules ditemukan dan aktif."
-          }
-          else {
-            Write-Warning "Tidak ditemukan firewall rule Remote Desktop yang aktif."
-          }
-
-      - name: Final RDP Report
-        shell: pwsh
-        env:
-          TAILSCALE_IP: ${{ secrets.TAILSCALE_IP }}
-        run: |
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "          RDP CHECK COMPLETE"
-          Write-Host "======================================"
-          Write-Host "RDP Service : OK"
-          Write-Host "RDP Registry: OK"
-          Write-Host "RDP Port    : 3389"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "======================================"
-          Write-Host ""
-          Write-Host "Semua pemeriksaan utama berhasil."
+This gives Tailscale more time to connect and provides better visibility into what's happening during the connection process.
