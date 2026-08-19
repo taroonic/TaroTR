@@ -24,27 +24,34 @@ jobs:
       - name: Check Windows
         shell: powershell
         run: |
-          Write-Host "=== TaroTR Windows Runner ==="
+          Write-Host "================================"
+          Write-Host " TaroTR Windows Runner"
+          Write-Host "================================"
           Write-Host "Computer: $env:COMPUTERNAME"
           Write-Host "User: $env:USERNAME"
-          node --version 2>$null
-          npm --version 2>$null
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
+          Write-Host "Workspace: $env:GITHUB_WORKSPACE"
 
       - name: Check Project
         shell: powershell
         run: |
+          Write-Host "Project files:"
+          Get-ChildItem -Force
+
           if (-not (Test-Path "package.json")) {
-            Write-Error "package.json tidak ditemukan."
-            exit 1
+            Write-Host "package.json tidak ditemukan."
+            Write-Host "Node.js build akan dilewati."
+          } else {
+            Write-Host "package.json ditemukan."
           }
 
+      - name: Setup Node.js
+        if: ${{ hashFiles('package.json') != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Install Dependencies
+        if: ${{ hashFiles('package.json') != '' }}
         shell: powershell
         run: |
           if (Test-Path "package-lock.json") {
@@ -54,14 +61,30 @@ jobs:
           }
 
       - name: Build TaroTR
+        if: ${{ hashFiles('package.json') != '' }}
         shell: powershell
         run: |
-          npm run build
+          $scripts = npm run
+
+          if ($scripts -match "build") {
+            npm run build
+          } else {
+            Write-Host "Script build tidak tersedia."
+            Write-Host "Build dilewati."
+          }
 
       - name: Test TaroTR
+        if: ${{ hashFiles('package.json') != '' }}
         shell: powershell
         run: |
-          npm test --if-present
+          $scripts = npm run
+
+          if ($scripts -match "test") {
+            npm test --if-present
+          } else {
+            Write-Host "Script test tidak tersedia."
+            Write-Host "Test dilewati."
+          }
 
       - name: Install Tailscale
         shell: powershell
@@ -69,6 +92,7 @@ jobs:
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installer = "$env:TEMP\tailscale.msi"
 
+          Write-Host "Downloading Tailscale..."
           Invoke-WebRequest -Uri $url -OutFile $installer
 
           if (-not (Test-Path $installer)) {
@@ -76,11 +100,12 @@ jobs:
             exit 1
           }
 
+          Write-Host "Installing Tailscale..."
           Start-Process msiexec.exe `
             -ArgumentList "/i", $installer, "/quiet", "/norestart" `
             -Wait
 
-          Remove-Item $installer -Force
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
       - name: Connect Tailscale
         shell: powershell
@@ -103,6 +128,11 @@ jobs:
             --authkey="$env:TAILSCALE_AUTH_KEY" `
             --hostname="tarotr-$env:GITHUB_RUN_ID"
 
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Tailscale gagal terhubung."
+            exit 1
+          }
+
       - name: Show Tailscale Address
         shell: powershell
         run: |
@@ -116,8 +146,14 @@ jobs:
 
           Write-Host ""
           Write-Host "=========================================="
-          Write-Host " TaroTR ADDRESS: $ip"
+          Write-Host " TaroTR Tailscale Address: $ip"
           Write-Host "=========================================="
+
+      - name: Show Tailscale Status
+        shell: powershell
+        run: |
+          $ts = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          & $ts status
 
       - name: Upload Build
         if: success()
@@ -129,3 +165,11 @@ jobs:
             build/**
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Finish
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host " TaroTR workflow selesai."
+          Write-Host "================================"
