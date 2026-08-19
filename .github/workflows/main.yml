@@ -24,50 +24,72 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+
           Write-Host "Windows runner ready"
           Write-Host "Computer: $env:COMPUTERNAME"
           Write-Host "User: $env:USERNAME"
           Write-Host "Workspace: $env:GITHUB_WORKSPACE"
 
-      - name: Install Tailscale (if missing)
+      - name: Install Tailscale if missing
         id: install
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Helper: find existing tailscale binary (in PATH or common Program Files dirs)
-          $tsPath = (Get-Command tailscale -ErrorAction SilentlyContinue)?.Source
+          $tsPath = $null
+
+          $command = Get-Command tailscale -ErrorAction SilentlyContinue
+          if ($command) {
+            $tsPath = $command.Source
+          }
+
           if (-not $tsPath) {
             $candidates = @(
-              Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe',
-              Join-Path $env:ProgramFiles 'Tailscale\Tailscale.exe'
+              (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
+              (Join-Path $env:ProgramFiles 'Tailscale\Tailscale.exe')
             )
-            if ($env:'ProgramFiles(x86)') {
-              $candidates += Join-Path $env:'ProgramFiles(x86)' 'Tailscale\tailscale.exe'
+
+            if (${env:ProgramFiles(x86)}) {
+              $candidates += Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe'
             }
-            $tsPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+            $tsPath = $candidates |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
           }
 
           if ($tsPath) {
-            Write-Host "Tailscale already installed at $tsPath. Skipping install."
-            return
+            Write-Host "Tailscale already installed at: $tsPath"
+            exit 0
           }
 
-          $msiUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup.msi'
+          $msiUrl = "https://pkgs.tailscale.com/stable/tailscale-setup.msi"
           $installer = Join-Path $env:TEMP 'tailscale.msi'
 
-          # Download with simple retry/backoff (PowerShell Core does not support -UseBasicParsing)
           $maxAttempts = 3
+
           for ($i = 1; $i -le $maxAttempts; $i++) {
             try {
-              Write-Host "Downloading Tailscale MSI (attempt $i)..."
-              Invoke-WebRequest -Uri $msiUrl -OutFile $installer -UseBasicParsing:$false 2>$null
-              if (Test-Path $installer) { break }
-              throw "Download failed (file missing)"
-            } catch {
-              if ($i -eq $maxAttempts) { throw "Failed to download Tailscale MSI after $maxAttempts attempts: $_" }
-              Write-Host "Download failed; retrying in $([int](5 * $i))s..."
-              Start-Sleep -Seconds (5 * $i)
+              Write-Host "Downloading Tailscale MSI - attempt $i"
+
+              Invoke-WebRequest `
+                -Uri $msiUrl `
+                -OutFile $installer
+
+              if (Test-Path $installer) {
+                break
+              }
+
+              throw "Installer tidak ditemukan setelah download."
+            }
+            catch {
+              if ($i -eq $maxAttempts) {
+                throw "Gagal download Tailscale MSI setelah $maxAttempts percobaan: $($_.Exception.Message)"
+              }
+
+              $delay = 5 * $i
+              Write-Host "Download gagal. Retry dalam $delay detik..."
+              Start-Sleep -Seconds $delay
             }
           }
 
@@ -75,41 +97,109 @@ jobs:
             throw "Tailscale installer gagal di-download."
           }
 
-          Write-Host "Installing Tailscale (msiexec)..."
-          $args = @("/i", $installer, "/quiet", "/norestart")
-          $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $args -Wait -NoNewWindow -PassThru
+          Write-Host "Installing Tailscale..."
+
+          $proc = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @(
+              "/i",
+              $installer,
+              "/quiet",
+              "/norestart"
+            ) `
+            -Wait `
+            -NoNewWindow `
+            -PassThru
 
           if ($proc.ExitCode -ne 0) {
             throw "Instalasi Tailscale gagal. Exit code: $($proc.ExitCode)"
           }
 
           Remove-Item $installer -Force -ErrorAction SilentlyContinue
-          Write-Host "Tailscale terpasang."
+
+          Write-Host "Tailscale installed successfully."
 
       - name: Ensure Tailscale service running
         id: ensure_service
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $candidates = 'Tailscale','TailscaleService'
-          $svc = $null
-          foreach ($name in $candidates) {
-            $s = Get-Service -Name $name -ErrorAction SilentlyContinue
-            if ($s) { $svc = $s; break }
-          }
 
-          if ($null -eq $svc) {
-            Write-Host "Service Tailscale tidak ditemukan — itu normal jika binary baru diinstall. Lanjutkan."
-          } else {
-            if ($svc.Status -ne 'Running') {
-              Write-Host "Starting service $($svc.Name)..."
-              Start-Service -Name $svc.Name
-              $svc.WaitForStatus('Running','00:00:30')
-              Write-Host "Service $($svc.Name) status: $($svc.Status)"
-            } else {
-              Write-Host "Service $($svc.Name) already running."
+          $serviceNames = @(
+            "Tailscale",
+            "TailscaleService"
+          )
+
+          $service = $null
+
+          foreach ($name in $serviceNames) {
+            $found = Get-Service `
+              -Name $name `
+              -ErrorAction SilentlyContinue
+
+            if ($found) {
+              $service = $found
+              break
             }
           }
+
+          if ($null -eq $service) {
+            Write-Host "Tailscale service tidak ditemukan."
+            Write-Host "Lanjutkan ke tahap berikutnya."
+            exit 0
+          }
+
+          if ($service.Status -ne "Running") {
+            Write-Host "Starting service: $($service.Name)"
+
+            Start-Service -Name $service.Name
+
+            $service.WaitForStatus(
+              "Running",
+              [TimeSpan]::FromSeconds(30)
+            )
+          }
+
+          Write-Host "Service: $($service.Name)"
+          Write-Host "Status : $($service.Status)"
+
+      - name: Locate Tailscale
+        id: locate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tsExe = $null
+
+          $command = Get-Command tailscale -ErrorAction SilentlyContinue
+
+          if ($command) {
+            $tsExe = $command.Source
+          }
+
+          if (-not $tsExe) {
+            $candidates = @(
+              (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
+              (Join-Path $env:ProgramFiles 'Tailscale\Tailscale.exe')
+            )
+
+            if (${env:ProgramFiles(x86)}) {
+              $candidates += Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe'
+            }
+
+            $tsExe = $candidates |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
+          }
+
+          if (-not $tsExe) {
+            throw "Tailscale executable tidak ditemukan."
+          }
+
+          Write-Host "Tailscale executable:"
+          Write-Host $tsExe
+
+          "ts_exe=$tsExe" >> $env:GITHUB_OUTPUT
 
       - name: Connect to Tailscale
         id: connect
@@ -118,58 +208,45 @@ jobs:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
+
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
             throw "Secret TAILSCALE_AUTH_KEY belum dibuat."
           }
 
-          # Prefer PATH, fall back to Program Files
-          $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue)?.Source
-          if (-not $tsExe) {
-            $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-            if (-not (Test-Path $tsExe) -and $env:'ProgramFiles(x86)') {
-              $tsExe = Join-Path $env:'ProgramFiles(x86)' 'Tailscale\tailscale.exe'
-            }
-          }
+          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
+
           if (-not (Test-Path $tsExe)) {
-            throw "Tailscale executable tidak ditemukan di Program Files atau PATH."
+            throw "Tailscale executable tidak ditemukan: $tsExe"
           }
 
-          Write-Host "Running 'tailscale up' (auth key hidden)..."
-          & "$tsExe" up --authkey="$env:TAILSCALE_AUTH_KEY" --accept-routes=false
+          Write-Host "Connecting to Tailscale..."
+
+          & $tsExe up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --accept-routes=false
+
           if ($LASTEXITCODE -ne 0) {
             throw "Tailscale gagal terhubung. Exit code: $LASTEXITCODE"
           }
 
-          # Wait briefly for the network to settle
           Start-Sleep -Seconds 3
 
-      - name: Get Tailscale IPv4 and status
+      - name: Get Tailscale IPv4
         id: get_ip
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue)?.Source
-          if (-not $tsExe) {
-            $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-            if (-not (Test-Path $tsExe) -and $env:'ProgramFiles(x86)') {
-              $tsExe = Join-Path $env:'ProgramFiles(x86)' 'Tailscale\tailscale.exe'
-            }
-          }
+          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
+
           if (-not (Test-Path $tsExe)) {
             throw "Tailscale executable tidak ditemukan."
           }
 
-          # Use tailscale ip -4 for IPv4; fallback to any ip if empty
-          $ip = (& "$tsExe" ip -4 2>$null).Trim()
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            $ip = (& "$tsExe" ip 2>$null).Trim()
-          }
+          $ip = (& $tsExe ip -4 2>$null).Trim()
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
-            Write-Host "Tailscale IP tidak ditemukan. Menampilkan 'tailscale status' untuk diagnosa:"
-            & "$tsExe" status || Write-Host "status command failed"
-            throw "Tailscale IP tidak tersedia."
+            throw "Tailscale IPv4 tidak tersedia."
           }
 
           Write-Host ""
@@ -177,44 +254,40 @@ jobs:
           Write-Host " TAILSCALE ADDRESS: $ip"
           Write-Host "=========================================="
 
-          # Export as job output
-          if ($env:GITHUB_OUTPUT) {
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "tailscale_ip=$ip"
-          } else {
-            Write-Host "::set-output name=tailscale_ip::$ip"
-          }
+          "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
 
-      - name: Show Status (short)
+      - name: Show Tailscale Status
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue)?.Source
-          if ($tsExe) {
-            & "$tsExe" status --no-ports 2>$null || & "$tsExe" status
-          } else {
-            Write-Host "Tailscale binary not found for status."
+          $ErrorActionPreference = 'Continue'
+
+          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
+
+          if (Test-Path $tsExe) {
+            & $tsExe status
+          }
+          else {
+            Write-Host "Tailscale executable tidak ditemukan."
           }
 
-      - name: Disconnect Tailscale (cleanup)
+      - name: Disconnect Tailscale
         if: always()
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue)?.Source
-          if (-not $tsExe) {
-            $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-            if (-not (Test-Path $tsExe) -and $env:'ProgramFiles(x86)') {
-              $tsExe = Join-Path $env:'ProgramFiles(x86)' 'Tailscale\tailscale.exe'
-            }
+
+          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
+
+          if ($tsExe -and (Test-Path $tsExe)) {
+            Write-Host "Disconnecting Tailscale..."
+            & $tsExe down
           }
-          if (Test-Path $tsExe) {
-            Write-Host "Running 'tailscale down' to disconnect the node..."
-            & "$tsExe" down || Write-Host "tailscale down failed or not necessary"
-          } else {
-            Write-Host "No tailscale binary found; skipping disconnect."
+          else {
+            Write-Host "Tailscale tidak ditemukan. Cleanup dilewati."
           }
 
       - name: Finish
+        if: always()
         shell: pwsh
         run: |
           Write-Host ""
