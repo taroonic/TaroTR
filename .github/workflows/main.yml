@@ -1,0 +1,51 @@
+name: TaroTR
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-runner:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure Windows
+        shell: powershell
+        run: |
+          Write-Host "Windows runner siap digunakan."
+          Write-Host "Computer: $env:COMPUTERNAME"
+          Write-Host "User: $env:USERNAME"
+
+      - name: Install Dependencies
+        shell: powershell
+        run: |
+          # Contoh instalasi dependency
+          choco --version
+          git --version
+
+      - name: Run Application
+        shell: powershell
+        run: |
+          # Ganti dengan perintah aplikasi kamu
+          if (Test-Path ".\app.exe") {
+              Start-Process ".\app.exe" -Wait
+          } else {
+              Write-Host "app.exe belum ditemukan."
+          }
+
+      - name: Collect Logs
+        if: always()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path logs
+          Get-ComputerInfo | Out-File logs/system-info.txt
+
+      - name: Upload Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runner-logs
+          path: logs/
