@@ -1,3 +1,4 @@
+```yaml
 name: TaroTR
 
 on:
@@ -9,43 +10,69 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout TaroTR
         uses: actions/checkout@v4
 
-      - name: Configure Windows
+      - name: System Information
         shell: powershell
         run: |
-          Write-Host "Windows runner siap digunakan."
-          Write-Host "Computer: $env:COMPUTERNAME"
-          Write-Host "User: $env:USERNAME"
+          Write-Host "======================================"
+          Write-Host "          TaroTR Windows Runner"
+          Write-Host "======================================"
+          Write-Host "Computer : $env:COMPUTERNAME"
+          Write-Host "Runner ID: $env:GITHUB_RUN_ID"
+          Write-Host "OS       : $([System.Environment]::OSVersion.Version)"
+          Write-Host "======================================"
 
-      - name: Install Dependencies
+      - name: Install Tailscale
         shell: powershell
         run: |
-          # Contoh instalasi dependency
-          choco --version
-          git --version
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
 
-      - name: Run Application
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait
+
+          Remove-Item $installer -Force
+
+      - name: Connect Tailscale
         shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Ganti dengan perintah aplikasi kamu
-          if (Test-Path ".\app.exe") {
-              Start-Process ".\app.exe" -Wait
-          } else {
-              Write-Host "app.exe belum ditemukan."
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY belum diset di GitHub Secrets."
           }
 
-      - name: Collect Logs
-        if: always()
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale tidak ditemukan."
+          }
+
+          & $ts up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="tarotr-$env:GITHUB_RUN_ID"
+
+      - name: Show Tailscale Address
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path logs
-          Get-ComputerInfo | Out-File logs/system-info.txt
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-      - name: Upload Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-runner-logs
-          path: logs/
+          $ip = & $ts ip -4
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "Alamat Tailscale tidak ditemukan."
+          }
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "          TAROTR ADDRESS"
+          Write-Host "======================================"
+          Write-Host "Tailscale IPv4 : $ip"
+          Write-Host "Hostname       : tarotr-$env:GITHUB_RUN_ID"
+          Write-Host "======================================"
+```
