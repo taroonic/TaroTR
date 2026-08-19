@@ -1,83 +1,187 @@
-I'll help you find a solution for this failing job. Let me start by retrieving the job logs.Now let me get the workflow file to understand the full context:## Solution
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-The job is failing because **Tailscale failed to assign an IP address within the timeout period**. The error occurs in the "Establish Tailscale Connection" step:
+          Write-Host "======================================"
+          Write-Host "       ESTABLISH TAILSCALE"
+          Write-Host "======================================"
 
-```
-Write-Error: Tailscale IP not assigned. Exiting.
-```
-
-### Root Cause
-
-The script waits up to 60 seconds (12 retries × 5 seconds) for Tailscale to assign an IPv4 address after running `tailscale up`. The connection failed to complete within this window, likely due to:
-
-1. **Tailscale service not starting properly** after installation
-2. **Network connectivity issues** on the runner
-3. **Auth key validation timeout** or failure
-4. **Insufficient wait time** for the Tailscale daemon to initialize
-
-### Recommended Fix
-
-Update the "Establish Tailscale Connection" step in [`.github/workflows/main.yml`](https://github.com/taroonic/TaroTR/blob/575c7788372ae2a0c5ce216fe36ea865e5caa5c0/.github/workflows/main.yml) (lines 127-165):
-
-```powershell
-- name: Establish Tailscale Connection
-  shell: pwsh
-  env:
-    TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-  run: |
-    if (-not $env:TAILSCALE_AUTH_KEY) {
-      Write-Error "Missing TAILSCALE_AUTH_KEY secret."
-      exit 1
-    }
-
-    $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-    if (-not (Test-Path $tsExe)) {
-      Write-Error "tailscale.exe not found at $tsExe"
-      exit 1
-    }
-
-    # Start tailscale with authkey and a unique hostname
-    Write-Host "Starting Tailscale..."
-    & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID" 2>$null
-    
-    # Add initial wait for daemon to initialize
-    Start-Sleep -Seconds 10
-
-    # Wait for an IPv4 address from Tailscale (increased retries to 30 = 150 seconds)
-    $tsIP = $null
-    $retries = 0
-    while ((-not $tsIP) -and ($retries -lt 30)) {
-      try {
-        $ipOut = & $tsExe ip -4 2>$null
-        if ($ipOut) {
-          $tsIP = ($ipOut -split "\r?\n" | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1).Trim()
-          if ($tsIP) {
-            Write-Host "Tailscale IP detected on retry $retries : $tsIP"
-            break
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            Write-Error "TAILSCALE_AUTH_KEY secret belum tersedia."
+            exit 1
           }
-        }
-      } catch {
-        Write-Host "Error querying Tailscale IP (retry $retries): $_"
-      }
-      Start-Sleep -Seconds 5
-      $retries++
-    }
 
-    if (-not $tsIP) {
-      Write-Error "Tailscale IP not assigned after $($retries * 5) seconds. Exiting."
-      exit 1
-    }
+          # Cari tailscale.exe
+          $tsExe = $null
 
-    # Persist IP for later steps if needed
-    "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-    Write-Host "Tailscale connection established. IP: $tsIP"
-```
+          $possiblePaths = @(
+            "$env:ProgramFiles\Tailscale\tailscale.exe",
+            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+          )
 
-### Key Changes
+          foreach ($path in $possiblePaths) {
+            if (Test-Path $path) {
+              $tsExe = $path
+              break
+            }
+          }
 
-1. **Added 10-second initial delay** after `tailscale up` to allow daemon startup
-2. **Increased retry count from 12 to 30** (150 seconds total instead of 60)
-3. **Added error handling and logging** to debug IP query failures
-4. **Added success confirmation** in the loop to exit early when IP is found
+          if (-not $tsExe) {
+            $cmd = Get-Command tailscale.exe -ErrorAction SilentlyContinue
 
-This gives Tailscale more time to connect and provides better visibility into what's happening during the connection process.
+            if ($cmd) {
+              $tsExe = $cmd.Source
+            }
+          }
+
+          if (-not $tsExe) {
+            Write-Error "tailscale.exe tidak ditemukan."
+            exit 1
+          }
+
+          Write-Host "Tailscale executable: $tsExe"
+
+          # Pastikan daemon/service berjalan
+          $tsService = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+
+          if ($tsService) {
+            Write-Host "Tailscale service status: $($tsService.Status)"
+
+            if ($tsService.Status -ne "Running") {
+              Write-Host "Starting Tailscale service..."
+
+              Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+
+              Start-Sleep -Seconds 5
+
+              $tsService.Refresh()
+              Write-Host "Tailscale service status: $($tsService.Status)"
+            }
+          }
+          else {
+            Write-Warning "Windows service Tailscale tidak ditemukan."
+          }
+
+          # Versi CLI
+          Write-Host ""
+          Write-Host "Tailscale version:"
+          & $tsExe version
+
+          # Login / connect
+          Write-Host ""
+          Write-Host "Connecting to Tailscale..."
+
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          $upOutput = & $tsExe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=$hostname" 2>&1
+
+          $upExitCode = $LASTEXITCODE
+
+          Write-Host "tailscale up exit code: $upExitCode"
+
+          if ($upOutput) {
+            $upOutput | ForEach-Object {
+              Write-Host $_
+            }
+          }
+
+          if ($upExitCode -ne 0) {
+            Write-Error "tailscale up gagal."
+            exit 1
+          }
+
+          # Beri daemon waktu untuk menyelesaikan koneksi
+          Write-Host ""
+          Write-Host "Waiting for Tailscale connection..."
+
+          $tsIP = $null
+          $maxRetries = 30
+
+          for ($i = 1; $i -le $maxRetries; $i++) {
+
+            Write-Host "Attempt $i/$maxRetries..."
+
+            try {
+              $ipOutput = & $tsExe ip -4 2>&1
+
+              if ($LASTEXITCODE -eq 0 -and $ipOutput) {
+
+                foreach ($line in $ipOutput) {
+
+                  $lineText = "$line".Trim()
+
+                  if ($lineText -match '^\s*(\d{1,3}\.){3}\d{1,3}\s*$') {
+                    $tsIP = $lineText
+                    break
+                  }
+                }
+              }
+            }
+            catch {
+              Write-Host "IP query error: $($_.Exception.Message)"
+            }
+
+            if ($tsIP) {
+              break
+            }
+
+            # Tampilkan status untuk debugging
+            try {
+              $statusOutput = & $tsExe status 2>&1
+
+              if ($statusOutput) {
+                Write-Host "Tailscale status:"
+                $statusOutput | Select-Object -First 5 | ForEach-Object {
+                  Write-Host "  $_"
+                }
+              }
+            }
+            catch {
+              Write-Host "Unable to read Tailscale status."
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            Write-Host ""
+            Write-Host "======================================"
+            Write-Host "TAILSCALE DEBUG INFORMATION"
+            Write-Host "======================================"
+
+            try {
+              & $tsExe status
+            }
+            catch {
+              Write-Host "status failed: $($_.Exception.Message)"
+            }
+
+            try {
+              & $tsExe netcheck
+            }
+            catch {
+              Write-Host "netcheck failed: $($_.Exception.Message)"
+            }
+
+            Write-Host "======================================"
+
+            Write-Error "Tailscale IP tidak berhasil diperoleh."
+            exit 1
+          }
+
+          # Simpan untuk step berikutnya
+          "TAILSCALE_IP=$tsIP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "Tailscale connection established."
+          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "======================================"
