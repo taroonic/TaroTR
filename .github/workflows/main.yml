@@ -10,34 +10,57 @@ jobs:
 
     steps:
       - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' 
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 
-                             -Name "SecurityLayer" -Value 0 -Force
+          # Require admin
+          $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          if (-not $isAdmin) {
+            Write-Error "This step requires Administrator privileges."
+            exit 1
+          }
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" 
-            dir=in action=allow protocol=TCP localport=3389
+          # Backup current values (optional)
+          $backup = @{
+            fDenyTSConnections = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue).fDenyTSConnections
+            UserAuthentication = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -ErrorAction SilentlyContinue).UserAuthentication
+            SecurityLayer      = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -ErrorAction SilentlyContinue).SecurityLayer
+          }
+          $backupFile = Join-Path $env:RUNNER_TEMP 'rdp_registry_backup.json'
+          $backup | ConvertTo-Json | Out-File -FilePath $backupFile -Encoding utf8
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
+          # Enable Remote Desktop (fDenyTSConnections = 0)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+
+          # Recommended: Require Network Level Authentication (UserAuthentication = 1) and use SecurityLayer = 2 (TLS)
+          # If you must disable NLA for compatibility, set UserAuthentication = 0 and SecurityLayer = 0 (less secure).
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 2 -Force
+
+          # Remove any existing firewall rule with the same name (ignore errors)
+          try {
+            netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          } catch {
+            Write-Host "No previous RDP-Tailscale rule to delete or deletion failed (continuing)."
+          }
+
+          # Create firewall rule allowing inbound TCP 3389; consider restricting RemoteIP to Tailscale ranges later
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # Restart Remote Desktop service to apply changes
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+
+          Write-Host "RDP configured. Backup saved to: $backupFile"
 
       - name: Create RDP User with Secure Password
+        id: create_user
+        shell: pwsh
         run: |
-          Add-Type -AssemblyName System.Security
+          # Generate a strong password
           $charSet = @{
               Upper   = [char[]](65..90)      # A-Z
               Lower   = [char[]](97..122)     # a-z
               Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -45,43 +68,104 @@ jobs:
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          # Create secure string and user (only if not exists)
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          $username = 'RDP'
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -Description "Temporary RDP user for GitHub Actions job" -UserMayNotChangePassword:$false -ErrorAction Stop
+            Write-Host "Local user '$username' created."
+          } else {
+            Write-Host "Local user '$username' already exists. Updating password."
+            $user = Get-LocalUser -Name $username
+            $user | Set-LocalUser -Password $securePass
           }
 
+          # Add user to Remote Desktop Users (not Administrators by default)
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username -ErrorAction SilentlyContinue
+
+          # Verify creation
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"
+            exit 1
+          }
+
+          # Save credentials to a file in RUNNER_TEMP and output path for the next step to upload as artifact.
+          $credsFile = Join-Path $env:RUNNER_TEMP 'rdp_creds.txt'
+          "User: $username`nPassword: $password" | Out-File -FilePath $credsFile -Encoding utf8
+          Write-Host "CREDS_FILE=$credsFile"  # visible in logs, path only (password file not printed)
+
+          # Export the path as step output for use by later steps
+          Write-Output "::set-output name=creds_path::$credsFile"
+
+      - name: Upload RDP credentials (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials
+          path: ${{ steps.create_user.outputs.creds_path }}
+          retention-days: 1
+
+      - name: Remove local creds file
+        if: always()
+        shell: pwsh
+        run: |
+          $path = '${{ steps.create_user.outputs.creds_path }}'
+          if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
+
       - name: Install Tailscale
+        shell: pwsh
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP ailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", ""$installerPath"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
       - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale ailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+            Write-Error "Missing TAILSCALE_AUTH_KEY secret."
+            exit 1
+          }
+
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "tailscale.exe not found at $tsExe"
+            exit 1
+          }
+
+          # Start tailscale with authkey and a unique hostname
+          & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$env:GITHUB_RUN_ID" 2>$null
+
+          # Wait for an IPv4 address from Tailscale
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale ailscale.exe" ip -4
+          while ((-not $tsIP) -and ($retries -lt 12)) {
+              $ipOut = & $tsExe ip -4 2>$null
+              if ($ipOut) {
+                  $tsIP = ($ipOut -split "\r?\n" | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1).Trim()
+              }
               Start-Sleep -Seconds 5
               $retries++
           }
-          
+
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          # Persist IP for later steps if needed
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Tailscale IP detected: $tsIP"
+
+      - name: Show connection info
+        shell: pwsh
+        run: |
+          Write-Host "RDP user created: RDP"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
