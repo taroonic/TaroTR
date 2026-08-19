@@ -1,73 +1,74 @@
-# TaroTR Windows Tailscale Runner
-
-```yaml
-name: TaroTR
+name: Build TaroTR
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 360
+  build:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Check Windows
-        shell: powershell
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Check project
         run: |
-          Write-Host "Runner: $env:COMPUTERNAME"
-          Write-Host "User: $env:USERNAME"
-
-      - name: Install Tailscale
-        shell: powershell
-        run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest -Uri $url -OutFile $installer
-
-          Start-Process msiexec.exe `
-            -ArgumentList "/i", $installer, "/quiet", "/norestart" `
-            -Wait
-
-          Remove-Item $installer -Force
-
-      - name: Connect Tailscale
-        shell: powershell
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $ts = "${env:ProgramFiles}\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $ts)) {
-            throw "Tailscale tidak ditemukan."
+          test -f package.json || {
+            echo "package.json tidak ditemukan"
+            exit 1
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "Secret TAILSCALE_AUTH_KEY belum dibuat."
-          }
+          echo "Project ditemukan:"
+          cat package.json
 
-          & $ts up `
-            --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="gh-runner-$env:GITHUB_RUN_ID"
-
-      - name: Show Tailscale Address
-        shell: powershell
+      - name: Install dependencies
         run: |
-          $ts = "${env:ProgramFiles}\Tailscale\tailscale.exe"
-          $ip = (& $ts ip -4).Trim()
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Tailscale IP tidak ditemukan."
-          }
+      - name: Build TaroTR
+        run: npm run build
 
-          Write-Host "================================"
-          Write-Host "Tailscale Address: $ip"
-          Write-Host "================================"
-
-      - name: Keep Runner Active
-        shell: powershell
+      - name: Verify build
         run: |
-          Write-Host "Runner aktif."
-          Start-Sleep -Seconds 60
-```
+          if [ -d "dist" ]; then
+            echo "Build ditemukan di dist/"
+            find dist -maxdepth 2 -type f | head -50
+          elif [ -d "build" ]; then
+            echo "Build ditemukan di build/"
+            find build -maxdepth 2 -type f | head -50
+          else
+            echo "ERROR: hasil build tidak ditemukan."
+            exit 1
+          fi
+
+      - name: Run tests
+        run: npm test --if-present
+
+      - name: Upload TaroTR
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaroTR
+          path: |
+            dist/**
+            build/**
+          if-no-files-found: error
+          retention-days: 7
