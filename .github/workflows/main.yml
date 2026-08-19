@@ -1,136 +1,309 @@
 - name: Verify and Report RDP Status
   shell: pwsh
   env:
-    # optional fallback; can be set from secrets or left empty if tailscale CLI available
     TAILSCALE_IP: ${{ secrets.TAILSCALE_IP }}
   run: |
+    $ErrorActionPreference = 'Continue'
+
     Write-Host "=== Verify and Report RDP Status ==="
+    Write-Host ""
 
-    $results = @()
+    $results = [System.Collections.Generic.List[object]]::new()
 
-    function Add-Result($name, $passed, $message) {
-      $results += [PSCustomObject]@{ name = $name; passed = [bool]$passed; message = $message }
-      if ($passed) { Write-Host "✓ $name: $message" } else { Write-Host "✗ $name: $message" }
+    function Add-Result {
+      param(
+        [string]$Name,
+        [bool]$Passed,
+        [string]$Message
+      )
+
+      $result = [PSCustomObject]@{
+        name    = $Name
+        passed  = $Passed
+        message = $Message
+      }
+
+      $results.Add($result)
+
+      if ($Passed) {
+        Write-Host "[PASS] $Name - $Message"
+      }
+      else {
+        Write-Host "[FAIL] $Name - $Message"
+      }
     }
 
-    # 1) RDP service
-    $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-    if (-not $rdpService) {
-      Add-Result "RDP Service" $false "TermService tidak ditemukan"
-    } elseif ($rdpService.Status -ne 'Running') {
-      Add-Result "RDP Service" $false "Status: $($rdpService.Status)"
-    } else {
-      Add-Result "RDP Service" $true "Running"
-    }
-
-    # 2) Registry fDenyTSConnections
-    $fDenyObj = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -ErrorAction SilentlyContinue
-    if (-not $fDenyObj -or $null -eq $fDenyObj.fDenyTSConnections) {
-      Add-Result "Remote Desktop Registry" $false "Nilai registry tidak ditemukan"
-    } elseif ($fDenyObj.fDenyTSConnections -ne 0) {
-      Add-Result "Remote Desktop Registry" $false "fDenyTSConnections=$($fDenyObj.fDenyTSConnections) (expected 0)"
-    } else {
-      Add-Result "Remote Desktop Registry" $true "fDenyTSConnections=0"
-    }
-
-    # 3) Local user RDP exists and enabled
-    $rdpUser = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
-    if (-not $rdpUser) {
-      Add-Result "RDP User Account" $false "Account 'RDP' tidak ditemukan"
-    } elseif ($rdpUser.Enabled -ne $true) {
-      Add-Result "RDP User Account" $false "Account ditemukan tapi disabled"
-    } else {
-      Add-Result "RDP User Account" $true "Exists and enabled"
-    }
-
-    # 4) Membership in Remote Desktop Users
-    $inGroup = $false
-    $members = Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction SilentlyContinue
-    if ($members) {
-      if ($members | Where-Object { $_.Name -eq 'RDP' -or $_.Name -like '*\RDP' }) { $inGroup = $true }
-    }
-    if ($inGroup) {
-      Add-Result "Remote Desktop Users Membership" $true "RDP is member"
-    } else {
-      Add-Result "Remote Desktop Users Membership" $false "RDP not member or group not found"
-    }
-
-    # 5) Firewall rule (use PowerShell API)
-    $fwRule = $null
+    # --------------------------------------------------
+    # 1. RDP SERVICE
+    # --------------------------------------------------
     try {
-      $fwRule = Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
-    } catch { $fwRule = $null }
-    if ($fwRule) {
-      Add-Result "Firewall Rule" $true "RDP-Tailscale found"
-    } else {
-      Add-Result "Firewall Rule" $false "RDP-Tailscale not found"
+      $rdpService = Get-Service -Name TermService -ErrorAction Stop
+
+      if ($rdpService.Status -eq 'Running') {
+        Add-Result "RDP Service" $true "TermService is Running"
+      }
+      else {
+        Add-Result "RDP Service" $false "TermService status: $($rdpService.Status)"
+      }
+    }
+    catch {
+      Add-Result "RDP Service" $false "TermService tidak ditemukan: $($_.Exception.Message)"
     }
 
-    # 6) Tailscale IP (env or CLI)
-    $tsIP = $env:TAILSCALE_IP
-    $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-    if ([string]::IsNullOrWhiteSpace($tsIP) -and (Test-Path $tsExe)) {
-      try {
-        $ipOut = & $tsExe ip -4 2>$null
-        $match = ($ipOut | Select-String -Pattern '\d+\.\d+\.\d+\.\d+' -AllMatches).Matches
-        if ($match.Count -gt 0) { $tsIP = $match[0].Value }
-      } catch { }
+    # --------------------------------------------------
+    # 2. RDP REGISTRY
+    # --------------------------------------------------
+    try {
+      $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+      $reg = Get-ItemProperty -Path $regPath -Name fDenyTSConnections -ErrorAction Stop
+
+      if ($reg.fDenyTSConnections -eq 0) {
+        Add-Result "RDP Registry" $true "fDenyTSConnections=0"
+      }
+      else {
+        Add-Result "RDP Registry" $false "fDenyTSConnections=$($reg.fDenyTSConnections)"
+      }
     }
-    if ([string]::IsNullOrWhiteSpace($tsIP)) {
-      Add-Result "Tailscale IP" $false "TAILSCALE_IP not set and tailscale CLI did not return an IP"
-    } else {
+    catch {
+      Add-Result "RDP Registry" $false "Registry check failed: $($_.Exception.Message)"
+    }
+
+    # --------------------------------------------------
+    # 3. RDP USER
+    # --------------------------------------------------
+    try {
+      $rdpUser = Get-LocalUser -Name 'RDP' -ErrorAction Stop
+
+      if ($rdpUser.Enabled) {
+        Add-Result "RDP User" $true "RDP account exists and is enabled"
+      }
+      else {
+        Add-Result "RDP User" $false "RDP account exists but is disabled"
+      }
+    }
+    catch {
+      Add-Result "RDP User" $false "RDP account not found"
+    }
+
+    # --------------------------------------------------
+    # 4. REMOTE DESKTOP USERS GROUP
+    # --------------------------------------------------
+    try {
+      $group = Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction Stop
+
+      $member = $group | Where-Object {
+        $_.Name -eq 'RDP' -or
+        $_.Name -like '*\RDP'
+      }
+
+      if ($member) {
+        Add-Result "RDP Group Membership" $true "RDP is member of Remote Desktop Users"
+      }
+      else {
+        Add-Result "RDP Group Membership" $false "RDP is not in Remote Desktop Users"
+      }
+    }
+    catch {
+      Add-Result "RDP Group Membership" $false "Could not check group: $($_.Exception.Message)"
+    }
+
+    # --------------------------------------------------
+    # 5. FIREWALL
+    # --------------------------------------------------
+    try {
+      $fw = Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
+
+      if ($fw) {
+        $enabled = $fw | Where-Object { $_.Enabled -eq 'True' }
+
+        if ($enabled) {
+          Add-Result "Firewall Rule" $true "RDP-Tailscale rule exists and is enabled"
+        }
+        else {
+          Add-Result "Firewall Rule" $false "RDP-Tailscale exists but is disabled"
+        }
+      }
+      else {
+        Add-Result "Firewall Rule" $false "RDP-Tailscale rule not found"
+      }
+    }
+    catch {
+      Add-Result "Firewall Rule" $false "Firewall check failed: $($_.Exception.Message)"
+    }
+
+    # --------------------------------------------------
+    # 6. TAILSCALE CLI
+    # --------------------------------------------------
+    $tsExe = $null
+
+    $possiblePaths = @(
+      "$env:ProgramFiles\Tailscale\tailscale.exe",
+      "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+    )
+
+    foreach ($path in $possiblePaths) {
+      if (Test-Path $path) {
+        $tsExe = $path
+        break
+      }
+    }
+
+    if (-not $tsExe) {
+      $command = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+
+      if ($command) {
+        $tsExe = $command.Source
+      }
+    }
+
+    if ($tsExe) {
+      Add-Result "Tailscale CLI" $true "Found: $tsExe"
+    }
+    else {
+      Add-Result "Tailscale CLI" $false "tailscale.exe not found"
+    }
+
+    # --------------------------------------------------
+    # 7. TAILSCALE IP
+    # --------------------------------------------------
+    $tsIP = $env:TAILSCALE_IP
+
+    if ($tsExe -and [string]::IsNullOrWhiteSpace($tsIP)) {
+      try {
+        $ipOutput = & $tsExe ip -4 2>$null
+
+        $ipMatch = $ipOutput |
+          Select-String -Pattern '\b100\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}\b' -AllMatches
+
+        if ($ipMatch) {
+          $tsIP = $ipMatch.Matches[0].Value
+        }
+      }
+      catch {
+        Write-Host "Tidak bisa mengambil IP dari Tailscale CLI."
+      }
+    }
+
+    if ($tsIP) {
       Add-Result "Tailscale IP" $true "IP=$tsIP"
     }
-
-    # 7) RDP port connectivity (localhost)
-    $portOk = $false
-    try {
-      $tcp = New-Object System.Net.Sockets.TcpClient
-      $async = $tcp.BeginConnect('127.0.0.1', 3389, $null, $null)
-      $wait = $async.AsyncWaitHandle.WaitOne(2000)
-      if ($wait -and $tcp.Connected) { $portOk = $true; $tcp.Close() }
-    } catch { $portOk = $false }
-    if ($portOk) {
-      Add-Result "RDP Port" $true "127.0.0.1:3389 is reachable"
-    } else {
-      Add-Result "RDP Port" $false "127.0.0.1:3389 not reachable"
+    else {
+      Add-Result "Tailscale IP" $false "Tailscale IP tidak tersedia"
     }
 
-    # 8) Tailscale status (optional check via CLI presence)
-    if (Test-Path $tsExe) {
+    # --------------------------------------------------
+    # 8. TAILSCALE STATUS
+    # --------------------------------------------------
+    if ($tsExe) {
       try {
-        $status = & $tsExe status 2>$null
-        if ($status) { Add-Result "Tailscale Status" $true "tailscale status returned"; } else { Add-Result "Tailscale Status" $false "tailscale status empty" }
-      } catch { Add-Result "Tailscale Status" $false "tailscale status failed: $_" }
-    } else {
-      Add-Result "Tailscale Status" $false "tailscale.exe not found"
+        $status = & $tsExe status 2>&1
+
+        if ($LASTEXITCODE -eq 0 -and $status) {
+          Add-Result "Tailscale Status" $true "Tailscale status OK"
+        }
+        else {
+          Add-Result "Tailscale Status" $false "Tailscale status gagal"
+        }
+      }
+      catch {
+        Add-Result "Tailscale Status" $false "Tailscale status error"
+      }
+    }
+    else {
+      Add-Result "Tailscale Status" $false "tailscale.exe tidak tersedia"
     }
 
-    # Final summary
-    $failed = $results | Where-Object { -not $_.passed }
+    # --------------------------------------------------
+    # 9. LOCAL RDP PORT
+    # --------------------------------------------------
+    try {
+      $tcp = Test-NetConnection `
+        -ComputerName '127.0.0.1' `
+        -Port 3389 `
+        -WarningAction SilentlyContinue
+
+      if ($tcp.TcpTestSucceeded) {
+        Add-Result "RDP Port 3389" $true "127.0.0.1:3389 is reachable"
+      }
+      else {
+        Add-Result "RDP Port 3389" $false "127.0.0.1:3389 is not reachable"
+      }
+    }
+    catch {
+      Add-Result "RDP Port 3389" $false "Port test failed"
+    }
+
+    # --------------------------------------------------
+    # 10. TAILSCALE RDP PORT
+    # --------------------------------------------------
+    if ($tsIP) {
+      try {
+        $tcpTs = Test-NetConnection `
+          -ComputerName $tsIP `
+          -Port 3389 `
+          -WarningAction SilentlyContinue
+
+        if ($tcpTs.TcpTestSucceeded) {
+          Add-Result "Tailscale RDP Port" $true "$tsIP:3389 is reachable"
+        }
+        else {
+          Add-Result "Tailscale RDP Port" $false "$tsIP:3389 is not reachable"
+        }
+      }
+      catch {
+        Add-Result "Tailscale RDP Port" $false "Tailscale RDP test failed"
+      }
+    }
+    else {
+      Add-Result "Tailscale RDP Port" $false "Skipped because Tailscale IP unavailable"
+    }
+
+    # --------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------
     Write-Host ""
-    Write-Host "=== SUMMARY ==="
-    foreach ($r in $results) {
-      $mark = if ($r.passed) { 'PASS' } else { 'FAIL' }
-      Write-Host ("{0,-35} {1,-6} {2}" -f $r.name, $mark, $r.message)
+    Write-Host "======================================"
+    Write-Host "             RDP SUMMARY"
+    Write-Host "======================================"
+
+    foreach ($result in $results) {
+      $status = if ($result.passed) { "PASS" } else { "FAIL" }
+
+      Write-Host (
+        "{0,-28} {1,-6} {2}" -f `
+        $result.name,
+        $status,
+        $result.message
+      )
     }
 
-    $overallPassed = ($failed.Count -eq 0)
-    Write-Host ""
-    if ($overallPassed) {
-      Write-Host "All checks passed ✓"
-    } else {
-      Write-Host "One or more checks failed ✗"
-    }
+    Write-Host "======================================"
 
-    # Export JSON summary to GITHUB_OUTPUT for other steps to consume
-    $resultsJson = $results | ConvertTo-Json -Compress
+    # --------------------------------------------------
+    # GITHUB OUTPUT
+    # --------------------------------------------------
     if ($env:GITHUB_OUTPUT) {
-      # Write single-line JSON as step output key 'rdp_checks'
-      Add-Content -Path $env:GITHUB_OUTPUT -Value ("rdp_checks={0}" -f $resultsJson)
-    } else {
-      Write-Host "GITHUB_OUTPUT not available; skipping step output export."
+      $json = @($results) | ConvertTo-Json -Compress
+      Add-Content `
+        -Path $env:GITHUB_OUTPUT `
+        -Value "rdp_checks=$json"
     }
 
-    # Exit non-zero if any failed (so job fails)
-    if (-not $overallPassed) { exit 1 } else { exit 0 }
+    # --------------------------------------------------
+    # FINAL RESULT
+    # --------------------------------------------------
+    $failed = @($results | Where-Object { -not $_.passed })
+
+    Write-Host ""
+    Write-Host "Total checks : $($results.Count)"
+    Write-Host "Failed checks: $($failed.Count)"
+
+    if ($failed.Count -gt 0) {
+      Write-Host ""
+      Write-Host "RDP verification FAILED."
+      exit 1
+    }
+
+    Write-Host ""
+    Write-Host "All RDP checks PASSED."
+    exit 0
