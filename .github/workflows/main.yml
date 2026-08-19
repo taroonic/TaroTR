@@ -1,78 +1,41 @@
-```yaml
-name: TaroTR
-
+Kasih mirip kayak seperti ini 
+name: RDP
+\# rdp by yamzz modifed
 on:
-  workflow_dispatch:
-
+workflow\_dispatch:
 jobs:
-  windows-runner:
-    runs-on: windows-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Checkout TaroTR
-        uses: actions/checkout@v4
-
-      - name: System Information
-        shell: powershell
-        run: |
-          Write-Host "======================================"
-          Write-Host "          TaroTR Windows Runner"
-          Write-Host "======================================"
-          Write-Host "Computer : $env:COMPUTERNAME"
-          Write-Host "Runner ID: $env:GITHUB_RUN_ID"
-          Write-Host "OS       : $([System.Environment]::OSVersion.Version)"
-          Write-Host "======================================"
-
-      - name: Install Tailscale
-        shell: powershell
-        run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest -Uri $url -OutFile $installer
-
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$installer`" /quiet /norestart" `
-            -Wait
-
-          Remove-Item $installer -Force
-
-      - name: Connect Tailscale
-        shell: powershell
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY belum diset di GitHub Secrets."
-          }
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $ts)) {
-            throw "Tailscale tidak ditemukan."
-          }
-
-          & $ts up `
-            --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="tarotr-$env:GITHUB_RUN_ID"
-
-      - name: Show Tailscale Address
-        shell: powershell
-        run: |
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          $ip = & $ts ip -4
-
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Alamat Tailscale tidak ditemukan."
-          }
-
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "          TAROTR ADDRESS"
-          Write-Host "======================================"
-          Write-Host "Tailscale IPv4 : $ip"
-          Write-Host "Hostname       : tarotr-$env:GITHUB_RUN_ID"
-          Write-Host "======================================"
-```
+secure-rdp:
+runs-on: windows-latest
+timeout-minutes: 3600
+steps:
+\- name: Configure Core RDP Settings By Yamzz
+run: |
+Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+netsh advfirewall firewall delete rule name="RDP-Tailscale"
+netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+Restart-Service -Name TermService -Force
+\- name: Create RDP User with Secure Password
+run: |
+$username = "YamzzOfficial"
+$password = "YamzzOffical\@123"
+$securePass = ConvertTo-SecureString $password -AsPlainText -Force
+New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+Add-LocalGroupMember -Group "Administrators" -Member $username
+Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+echo "RDP\_CREDS=User: $username | Password: $password" >> $env\:GITHUB\_ENV
+if (-not (Get-LocalUser -Name $username)) {
+exit 1
+}
+\- name: Install Tailscale
+run: |
+$tsUrl = "[https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi](https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi)"
+$installerPath = "$env\:TEMP\tailscale.msi"
+Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+Start-Process msiexec.exe -ArgumentList "/i", ""$installerPath"", "/quiet", "/norestart" -Wait
+Remove-Item $installerPath -Force
+\- name: Establish Tailscale Connection
+run: |
+& "$env\:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE\_AUTH\_KEY }} --hostname=gh-runner-$env\:GITHUB\_RUN\_ID
+$tsIP = $null
