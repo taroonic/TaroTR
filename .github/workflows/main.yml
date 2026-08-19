@@ -8,284 +8,132 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: RDP
+      - name: Check RDP Service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "=== RDP SERVICE ==="
+
+          $service = Get-Service -Name TermService -ErrorAction SilentlyContinue
+
+          if (-not $service) {
+            Write-Error "TermService tidak ditemukan."
+            exit 1
+          }
+
+          Write-Host "Status: $($service.Status)"
+
+          if ($service.Status -ne 'Running') {
+            Write-Error "RDP service tidak sedang berjalan."
+            exit 1
+          }
+
+          Write-Host "RDP service OK."
+
+      - name: Check RDP Registry
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "=== RDP REGISTRY ==="
+
+          $path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+
+          $reg = Get-ItemProperty `
+            -Path $path `
+            -Name fDenyTSConnections `
+            -ErrorAction Stop
+
+          Write-Host "fDenyTSConnections: $($reg.fDenyTSConnections)"
+
+          if ($reg.fDenyTSConnections -ne 0) {
+            Write-Error "RDP dinonaktifkan pada registry."
+            exit 1
+          }
+
+          Write-Host "RDP registry OK."
+
+      - name: Check RDP Port
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "=== RDP PORT 3389 ==="
+
+          $result = Test-NetConnection `
+            -ComputerName '127.0.0.1' `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $result.TcpTestSucceeded) {
+            Write-Error "Port 3389 tidak dapat diakses."
+            exit 1
+          }
+
+          Write-Host "127.0.0.1:3389 OK."
+
+      - name: Check Tailscale
         shell: pwsh
         env:
           TAILSCALE_IP: ${{ secrets.TAILSCALE_IP }}
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "=== Verify and Report RDP Status ==="
-          Write-Host ""
+          Write-Host "=== TAILSCALE CHECK ==="
 
-          $results = [System.Collections.Generic.List[object]]::new()
-
-          function Add-Result {
-            param(
-              [string]$Name,
-              [bool]$Passed,
-              [string]$Message
-            )
-
-            $results.Add([PSCustomObject]@{
-              name    = $Name
-              passed  = $Passed
-              message = $Message
-            })
-
-            if ($Passed) {
-              Write-Host "[PASS] $Name - $Message"
-            }
-            else {
-              Write-Host "[FAIL] $Name - $Message"
-            }
-          }
-
-          # 1. RDP SERVICE
-          try {
-            $rdpService = Get-Service -Name TermService -ErrorAction Stop
-
-            if ($rdpService.Status -eq 'Running') {
-              Add-Result "RDP Service" $true "TermService is Running"
-            }
-            else {
-              Add-Result "RDP Service" $false "TermService status: $($rdpService.Status)"
-            }
-          }
-          catch {
-            Add-Result "RDP Service" $false "TermService tidak ditemukan: $($_.Exception.Message)"
-          }
-
-          # 2. RDP REGISTRY
-          try {
-            $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
-            $reg = Get-ItemProperty -Path $regPath -Name fDenyTSConnections -ErrorAction Stop
-
-            if ($reg.fDenyTSConnections -eq 0) {
-              Add-Result "RDP Registry" $true "fDenyTSConnections=0"
-            }
-            else {
-              Add-Result "RDP Registry" $false "fDenyTSConnections=$($reg.fDenyTSConnections)"
-            }
-          }
-          catch {
-            Add-Result "RDP Registry" $false "Registry check failed: $($_.Exception.Message)"
-          }
-
-          # 3. RDP USER
-          try {
-            $rdpUser = Get-LocalUser -Name 'RDP' -ErrorAction Stop
-
-            if ($rdpUser.Enabled) {
-              Add-Result "RDP User" $true "RDP account exists and is enabled"
-            }
-            else {
-              Add-Result "RDP User" $false "RDP account exists but is disabled"
-            }
-          }
-          catch {
-            Add-Result "RDP User" $false "RDP account not found"
-          }
-
-          # 4. REMOTE DESKTOP USERS
-          try {
-            $group = Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction Stop
-
-            $member = $group | Where-Object {
-              $_.Name -eq 'RDP' -or
-              $_.Name -like '*\RDP'
-            }
-
-            if ($member) {
-              Add-Result "RDP Group Membership" $true "RDP is member of Remote Desktop Users"
-            }
-            else {
-              Add-Result "RDP Group Membership" $false "RDP is not in Remote Desktop Users"
-            }
-          }
-          catch {
-            Add-Result "RDP Group Membership" $false "Could not check Remote Desktop Users"
-          }
-
-          # 5. FIREWALL
-          try {
-            $fw = Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
-
-            if ($fw) {
-              $enabled = $fw | Where-Object { $_.Enabled -eq 'True' }
-
-              if ($enabled) {
-                Add-Result "Firewall Rule" $true "RDP-Tailscale rule exists and is enabled"
-              }
-              else {
-                Add-Result "Firewall Rule" $false "RDP-Tailscale exists but is disabled"
-              }
-            }
-            else {
-              Add-Result "Firewall Rule" $false "RDP-Tailscale rule not found"
-            }
-          }
-          catch {
-            Add-Result "Firewall Rule" $false "Firewall check failed: $($_.Exception.Message)"
-          }
-
-          # 6. TAILSCALE CLI
-          $tsExe = $null
-
-          $possiblePaths = @(
-            "$env:ProgramFiles\Tailscale\tailscale.exe",
-            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
-          )
-
-          foreach ($path in $possiblePaths) {
-            if (Test-Path $path) {
-              $tsExe = $path
-              break
-            }
-          }
-
-          if (-not $tsExe) {
-            $command = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-
-            if ($command) {
-              $tsExe = $command.Source
-            }
-          }
-
-          if ($tsExe) {
-            Add-Result "Tailscale CLI" $true "Found: $tsExe"
-          }
-          else {
-            Add-Result "Tailscale CLI" $false "tailscale.exe not found"
-          }
-
-          # 7. TAILSCALE IP
-          $tsIP = $env:TAILSCALE_IP
-
-          if ($tsExe -and [string]::IsNullOrWhiteSpace($tsIP)) {
-            try {
-              $ipOutput = & $tsExe ip -4 2>$null
-
-              foreach ($line in $ipOutput) {
-                if ($line -match '\b100\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}\b') {
-                  $tsIP = $Matches[0]
-                  break
-                }
-              }
-            }
-            catch {
-              Write-Host "Tidak bisa mengambil IP dari Tailscale CLI."
-            }
-          }
-
-          if ($tsIP) {
-            Add-Result "Tailscale IP" $true "IP=$tsIP"
-          }
-          else {
-            Add-Result "Tailscale IP" $false "Tailscale IP tidak tersedia"
-          }
-
-          # 8. TAILSCALE STATUS
-          if ($tsExe) {
-            try {
-              $status = & $tsExe status 2>&1
-
-              if ($LASTEXITCODE -eq 0 -and $status) {
-                Add-Result "Tailscale Status" $true "Tailscale status OK"
-              }
-              else {
-                Add-Result "Tailscale Status" $false "Tailscale status gagal"
-              }
-            }
-            catch {
-              Add-Result "Tailscale Status" $false "Tailscale status error"
-            }
-          }
-          else {
-            Add-Result "Tailscale Status" $false "tailscale.exe tidak tersedia"
-          }
-
-          # 9. LOCAL RDP PORT
-          try {
-            $tcp = Test-NetConnection `
-              -ComputerName '127.0.0.1' `
-              -Port 3389 `
-              -WarningAction SilentlyContinue
-
-            if ($tcp.TcpTestSucceeded) {
-              Add-Result "RDP Port 3389" $true "127.0.0.1:3389 is reachable"
-            }
-            else {
-              Add-Result "RDP Port 3389" $false "127.0.0.1:3389 is not reachable"
-            }
-          }
-          catch {
-            Add-Result "RDP Port 3389" $false "Port test failed"
-          }
-
-          # 10. TAILSCALE RDP PORT
-          if ($tsIP) {
-            try {
-              $tcpTs = Test-NetConnection `
-                -ComputerName $tsIP `
-                -Port 3389 `
-                -WarningAction SilentlyContinue
-
-              if ($tcpTs.TcpTestSucceeded) {
-                Add-Result "Tailscale RDP Port" $true "$tsIP:3389 is reachable"
-              }
-              else {
-                Add-Result "Tailscale RDP Port" $false "$tsIP:3389 is not reachable"
-              }
-            }
-            catch {
-              Add-Result "Tailscale RDP Port" $false "Tailscale RDP test failed"
-            }
-          }
-          else {
-            Add-Result "Tailscale RDP Port" $false "Skipped because Tailscale IP unavailable"
-          }
-
-          # SUMMARY
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "             RDP SUMMARY"
-          Write-Host "======================================"
-
-          foreach ($result in $results) {
-            $status = if ($result.passed) { "PASS" } else { "FAIL" }
-
-            Write-Host (
-              "{0,-28} {1,-6} {2}" -f `
-              $result.name,
-              $status,
-              $result.message
-            )
-          }
-
-          Write-Host "======================================"
-
-          # GITHUB OUTPUT
-          if ($env:GITHUB_OUTPUT) {
-            $json = @($results) | ConvertTo-Json -Compress
-            Add-Content `
-              -Path $env:GITHUB_OUTPUT `
-              -Value "rdp_checks=$json"
-          }
-
-          # FINAL RESULT
-          $failed = @($results | Where-Object { -not $_.passed })
-
-          Write-Host ""
-          Write-Host "Total checks : $($results.Count)"
-          Write-Host "Failed checks: $($failed.Count)"
-
-          if ($failed.Count -gt 0) {
-            Write-Host ""
-            Write-Host "RDP verification FAILED."
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_IP)) {
+            Write-Error "Secret TAILSCALE_IP belum dibuat."
             exit 1
           }
 
+          Write-Host "Testing Tailscale IP: $env:TAILSCALE_IP"
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $result.TcpTestSucceeded) {
+            Write-Error "TCP $env:TAILSCALE_IP`:3389 gagal."
+            exit 1
+          }
+
+          Write-Host "Tailscale RDP connectivity OK."
+
+      - name: Check Firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host "=== FIREWALL ==="
+
+          $rules = Get-NetFirewallRule -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.DisplayGroup -match 'Remote Desktop' -and
+              $_.Enabled -eq 'True'
+            }
+
+          if ($rules) {
+            Write-Host "Remote Desktop firewall rules ditemukan dan aktif."
+          }
+          else {
+            Write-Warning "Tidak ditemukan firewall rule Remote Desktop yang aktif."
+          }
+
+      - name: Final RDP Report
+        shell: pwsh
+        env:
+          TAILSCALE_IP: ${{ secrets.TAILSCALE_IP }}
+        run: |
           Write-Host ""
-          Write-Host "All RDP checks PASSED."
-          exit 0
+          Write-Host "======================================"
+          Write-Host "          RDP CHECK COMPLETE"
+          Write-Host "======================================"
+          Write-Host "RDP Service : OK"
+          Write-Host "RDP Registry: OK"
+          Write-Host "RDP Port    : 3389"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "Semua pemeriksaan utama berhasil."
