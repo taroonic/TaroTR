@@ -1,74 +1,99 @@
-name: Build TaroTR
+```yaml
+name: TaroTR
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Check project
+      - name: Check Windows Runner
+        shell: powershell
         run: |
-          test -f package.json || {
-            echo "package.json tidak ditemukan"
+          Write-Host "================================="
+          Write-Host " TaroTR Windows Runner"
+          Write-Host "================================="
+          Write-Host "Computer : $env:COMPUTERNAME"
+          Write-Host "User     : $env:USERNAME"
+          Write-Host "Windows  : $([Environment]::OSVersion.Version)"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          if (-not (Test-Path $installer)) {
+            Write-Error "Tailscale installer gagal didownload."
             exit 1
           }
 
-          echo "Project ditemukan:"
-          cat package.json
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", $installer, "/quiet", "/norestart" `
+            -Wait
 
-      - name: Install dependencies
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          $tailscale = "${env:ProgramFiles}\Tailscale\tailscale.exe"
 
-      - name: Build TaroTR
-        run: npm run build
-
-      - name: Verify build
-        run: |
-          if [ -d "dist" ]; then
-            echo "Build ditemukan di dist/"
-            find dist -maxdepth 2 -type f | head -50
-          elif [ -d "build" ]; then
-            echo "Build ditemukan di build/"
-            find build -maxdepth 2 -type f | head -50
-          else
-            echo "ERROR: hasil build tidak ditemukan."
+          if (-not (Test-Path $tailscale)) {
+            Write-Error "Tailscale tidak ditemukan."
             exit 1
-          fi
+          }
 
-      - name: Run tests
-        run: npm test --if-present
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            Write-Error "Secret TAILSCALE_AUTH_KEY belum dibuat."
+            exit 1
+          }
 
-      - name: Upload TaroTR
-        uses: actions/upload-artifact@v4
-        with:
-          name: TaroTR
-          path: |
-            dist/**
-            build/**
-          if-no-files-found: error
-          retention-days: 7
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="tarotr-$env:GITHUB_RUN_ID"
+
+      - name: Get Tailscale Address
+        shell: powershell
+        run: |
+          $tailscale = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+
+          $ip = (& $tailscale ip -4).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Error "Tailscale IP tidak ditemukan."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host " Tailscale Address: $ip"
+          Write-Host "================================="
+
+      - name: Show Tailscale Status
+        shell: powershell
+        run: |
+          $tailscale = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          & $tailscale status
+
+      - name: Finish
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "TaroTR workflow selesai."
+```
