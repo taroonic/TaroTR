@@ -3,292 +3,85 @@ name: RDP
 on:
   workflow_dispatch:
 
-concurrency:
-  group: rdp-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
 jobs:
-  rdp:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Prep runner
-        id: prep
-        shell: pwsh
+      - name: Configure Core RDP Settings
         run: |
-          $ErrorActionPreference = 'Stop'
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' 
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          Write-Host "Windows runner ready"
-          Write-Host "Computer: $env:COMPUTERNAME"
-          Write-Host "User: $env:USERNAME"
-          Write-Host "Workspace: $env:GITHUB_WORKSPACE"
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" 
+            dir=in action=allow protocol=TCP localport=3389
 
-      - name: Install Tailscale if missing
-        id: install
-        shell: pwsh
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          $tsPath = $null
-
-          $command = Get-Command tailscale -ErrorAction SilentlyContinue
-          if ($command) {
-            $tsPath = $command.Source
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          if (-not $tsPath) {
-            $candidates = @(
-              (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
-              (Join-Path $env:ProgramFiles 'Tailscale\Tailscale.exe')
-            )
-
-            if (${env:ProgramFiles(x86)}) {
-              $candidates += Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe'
-            }
-
-            $tsPath = $candidates |
-              Where-Object { Test-Path $_ } |
-              Select-Object -First 1
-          }
-
-          if ($tsPath) {
-            Write-Host "Tailscale already installed at: $tsPath"
-            exit 0
-          }
-
-          $msiUrl = "https://pkgs.tailscale.com/stable/tailscale-setup.msi"
-          $installer = Join-Path $env:TEMP 'tailscale.msi'
-
-          $maxAttempts = 3
-
-          for ($i = 1; $i -le $maxAttempts; $i++) {
-            try {
-              Write-Host "Downloading Tailscale MSI - attempt $i"
-
-              Invoke-WebRequest `
-                -Uri $msiUrl `
-                -OutFile $installer
-
-              if (Test-Path $installer) {
-                break
-              }
-
-              throw "Installer tidak ditemukan setelah download."
-            }
-            catch {
-              if ($i -eq $maxAttempts) {
-                throw "Gagal download Tailscale MSI setelah $maxAttempts percobaan: $($_.Exception.Message)"
-              }
-
-              $delay = 5 * $i
-              Write-Host "Download gagal. Retry dalam $delay detik..."
-              Start-Sleep -Seconds $delay
-            }
-          }
-
-          if (-not (Test-Path $installer)) {
-            throw "Tailscale installer gagal di-download."
-          }
-
-          Write-Host "Installing Tailscale..."
-
-          $proc = Start-Process `
-            -FilePath "msiexec.exe" `
-            -ArgumentList @(
-              "/i",
-              $installer,
-              "/quiet",
-              "/norestart"
-            ) `
-            -Wait `
-            -NoNewWindow `
-            -PassThru
-
-          if ($proc.ExitCode -ne 0) {
-            throw "Instalasi Tailscale gagal. Exit code: $($proc.ExitCode)"
-          }
-
-          Remove-Item $installer -Force -ErrorAction SilentlyContinue
-
-          Write-Host "Tailscale installed successfully."
-
-      - name: Ensure Tailscale service running
-        id: ensure_service
-        shell: pwsh
+      - name: Install Tailscale
         run: |
-          $ErrorActionPreference = 'Stop'
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP ailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", ""$installerPath"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          $serviceNames = @(
-            "Tailscale",
-            "TailscaleService"
-          )
-
-          $service = $null
-
-          foreach ($name in $serviceNames) {
-            $found = Get-Service `
-              -Name $name `
-              -ErrorAction SilentlyContinue
-
-            if ($found) {
-              $service = $found
-              break
-            }
-          }
-
-          if ($null -eq $service) {
-            Write-Host "Tailscale service tidak ditemukan."
-            Write-Host "Lanjutkan ke tahap berikutnya."
-            exit 0
-          }
-
-          if ($service.Status -ne "Running") {
-            Write-Host "Starting service: $($service.Name)"
-
-            Start-Service -Name $service.Name
-
-            $service.WaitForStatus(
-              "Running",
-              [TimeSpan]::FromSeconds(30)
-            )
-          }
-
-          Write-Host "Service: $($service.Name)"
-          Write-Host "Status : $($service.Status)"
-
-      - name: Locate Tailscale
-        id: locate
-        shell: pwsh
+      - name: Establish Tailscale Connection
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          $tsExe = $null
-
-          $command = Get-Command tailscale -ErrorAction SilentlyContinue
-
-          if ($command) {
-            $tsExe = $command.Source
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale ailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale ailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-          if (-not $tsExe) {
-            $candidates = @(
-              (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
-              (Join-Path $env:ProgramFiles 'Tailscale\Tailscale.exe')
-            )
-
-            if (${env:ProgramFiles(x86)}) {
-              $candidates += Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe'
-            }
-
-            $tsExe = $candidates |
-              Where-Object { Test-Path $_ } |
-              Select-Object -First 1
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
-
-          if (-not $tsExe) {
-            throw "Tailscale executable tidak ditemukan."
-          }
-
-          Write-Host "Tailscale executable:"
-          Write-Host $tsExe
-
-          "ts_exe=$tsExe" >> $env:GITHUB_OUTPUT
-
-      - name: Connect to Tailscale
-        id: connect
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "Secret TAILSCALE_AUTH_KEY belum dibuat."
-          }
-
-          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
-
-          if (-not (Test-Path $tsExe)) {
-            throw "Tailscale executable tidak ditemukan: $tsExe"
-          }
-
-          Write-Host "Connecting to Tailscale..."
-
-          & $tsExe up `
-            --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --accept-routes=false
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale gagal terhubung. Exit code: $LASTEXITCODE"
-          }
-
-          Start-Sleep -Seconds 3
-
-      - name: Get Tailscale IPv4
-        id: get_ip
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
-
-          if (-not (Test-Path $tsExe)) {
-            throw "Tailscale executable tidak ditemukan."
-          }
-
-          $ip = (& $tsExe ip -4 2>$null).Trim()
-
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Tailscale IPv4 tidak tersedia."
-          }
-
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host " TAILSCALE ADDRESS: $ip"
-          Write-Host "=========================================="
-
-          "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
-
-      - name: Show Tailscale Status
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
-
-          if (Test-Path $tsExe) {
-            & $tsExe status
-          }
-          else {
-            Write-Host "Tailscale executable tidak ditemukan."
-          }
-
-      - name: Disconnect Tailscale
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          $tsExe = "${{ steps.locate.outputs.ts_exe }}"
-
-          if ($tsExe -and (Test-Path $tsExe)) {
-            Write-Host "Disconnecting Tailscale..."
-            & $tsExe down
-          }
-          else {
-            Write-Host "Tailscale tidak ditemukan. Cleanup dilewati."
-          }
-
-      - name: Finish
-        if: always()
-        shell: pwsh
-        run: |
-          Write-Host ""
-          Write-Host "Workflow RDP selesai."
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
