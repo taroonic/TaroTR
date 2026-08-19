@@ -1,6 +1,4 @@
-
 name: RDP
-\# rdp by yamzz modifed
 on:
 workflow\_dispatch:
 jobs:
