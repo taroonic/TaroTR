@@ -1,91 +1,51 @@
-# ==========================================
-# AUTOMATIC RDP CONNECTION
-# ==========================================
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-$Server   = "100.73.36.38"
-$Username = "RDP"
-$Password = 'wP9#vL4$gT7!sQ2@dH6rXz1K'
+          $Username = 'RDP'
+          $Password = 'wP9#vL4$gT7!sQ2@dH6rXz1K'
 
-$RdpFile = Join-Path $env:TEMP "Tailscale-RDP.rdp"
-$Target  = "TERMSRV/$Server"
+          Write-Host "======================================"
+          Write-Host "       CREATE RDP USER"
+          Write-Host "======================================"
 
-Write-Host "=========================================="
-Write-Host "        TAILSCALE RDP CONNECTION"
-Write-Host "=========================================="
-Write-Host "Server  : $Server"
-Write-Host "User    : $Username"
-Write-Host "Password: [HIDDEN]"
-Write-Host ""
+          $SecurePassword = ConvertTo-SecureString `
+            $Password `
+            -AsPlainText `
+            -Force
 
-# Simpan kredensial ke Windows Credential Manager
-cmdkey /generic:$Target /user:$Username /pass:$Password | Out-Null
+          $user = Get-LocalUser `
+            -Name $Username `
+            -ErrorAction SilentlyContinue
 
-# Buat konfigurasi RDP
-$RdpConfig = @"
-full address:s:$Server
-username:s:$Username
-screen mode id:i:2
-desktopwidth:i:1920
-desktopheight:i:1080
-session bpp:i:32
-prompt for credentials:i:0
-authentication level:i:2
-enablecredsspsupport:i:1
-redirectclipboard:i:1
-redirectprinters:i:0
-redirectdrives:i:0
-audiomode:i:0
-compression:i:1
-autoreconnection enabled:i:1
-networkautodetect:i:1
-bandwidthautodetect:i:1
-"@
+          if ($user) {
+            Write-Host "User RDP sudah ada."
+            Set-LocalUser `
+              -Name $Username `
+              -Password $SecurePassword
 
-Set-Content `
-    -Path $RdpFile `
-    -Value $RdpConfig `
-    -Encoding ASCII
+            Enable-LocalUser `
+              -Name $Username
+          }
+          else {
+            Write-Host "Membuat user RDP..."
 
-Write-Host "RDP file dibuat:"
-Write-Host $RdpFile
-Write-Host ""
+            New-LocalUser `
+              -Name $Username `
+              -Password $SecurePassword `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword `
+              -Description "Remote Desktop User"
+          }
 
-# Pastikan Remote Desktop Client tersedia
-$Mstsc = "$env:SystemRoot\System32\mstsc.exe"
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
 
-if (-not (Test-Path $Mstsc)) {
-    Write-Error "mstsc.exe tidak ditemukan."
-    exit 1
-}
+          Enable-LocalUser -Name $Username
 
-# Tes koneksi TCP terlebih dahulu
-Write-Host "Testing $Server`:3389 ..."
-
-$Test = Test-NetConnection `
-    -ComputerName $Server `
-    -Port 3389 `
-    -WarningAction SilentlyContinue
-
-if (-not $Test.TcpTestSucceeded) {
-    Write-Host ""
-    Write-Host "Koneksi ke $Server`:3389 gagal."
-    Write-Host "Pastikan Tailscale aktif dan RDP pada PC tujuan berjalan."
-    exit 1
-}
-
-Write-Host "TCP connection berhasil."
-Write-Host ""
-Write-Host "Membuka Remote Desktop..."
-
-# Buka RDP
-Start-Process `
-    -FilePath $Mstsc `
-    -ArgumentList "`"$RdpFile`""
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "             RDP STARTED"
-Write-Host "=========================================="
-Write-Host "Server  : $Server"
-Write-Host "Username: $Username"
-Write-Host "=========================================="
+          Write-Host "Username : RDP"
+          Write-Host "Password : [HIDDEN]"
+          Write-Host "RDP user siap."
