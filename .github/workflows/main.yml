@@ -10,9 +10,6 @@ jobs:
 
     steps:
 
-      # =========================================================
-      # 1. CREATE RDP USER WITH SECURE PASSWORD
-      # =========================================================
       - name: Create RDP User with Secure Password
         shell: pwsh
         env:
@@ -32,7 +29,7 @@ jobs:
             throw "RDP_PASSWORD minimal 8 karakter."
           }
 
-          # Enable Remote Desktop
+          # Enable RDP
           $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
 
           Set-ItemProperty `
@@ -40,12 +37,12 @@ jobs:
             -Name "fDenyTSConnections" `
             -Value 0
 
-          # Enable RDP firewall rules
+          # Enable RDP firewall
           Enable-NetFirewallRule `
             -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
-          # Make sure TermService is running
+          # Start RDP service
           $termService = Get-Service `
             -Name "TermService" `
             -ErrorAction Stop
@@ -58,7 +55,7 @@ jobs:
             -Name "TermService" `
             -StartupType Automatic
 
-          # Secure password
+          # Password
           $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
@@ -66,7 +63,7 @@ jobs:
 
           $username = "RDP"
 
-          # Create/update user
+          # Create or update user
           $existingUser = Get-LocalUser `
             -Name $username `
             -ErrorAction SilentlyContinue
@@ -96,7 +93,7 @@ jobs:
               -Name $username
           }
 
-          # Add to Remote Desktop Users
+          # Add user to Remote Desktop Users
           $members = Get-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -ErrorAction SilentlyContinue
@@ -112,7 +109,7 @@ jobs:
               -Member $username
           }
 
-          # Verify
+          # Verify user
           $verifyUser = Get-LocalUser `
             -Name $username `
             -ErrorAction Stop
@@ -127,9 +124,7 @@ jobs:
           Write-Host "Password: [HIDDEN]"
           Write-Host "Enabled : $($verifyUser.Enabled)"
 
-      # =========================================================
-      # 2. INSTALL TAILSCALE
-      # =========================================================
+
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -146,8 +141,7 @@ jobs:
 
           Invoke-WebRequest `
             -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $msi `
-            -UseBasicParsing
+            -OutFile $msi
 
           if (-not (Test-Path $msi)) {
             throw "Tailscale MSI gagal didownload."
@@ -155,57 +149,50 @@ jobs:
 
           Write-Host "Installing Tailscale..."
 
-          $process = Start-Process `
+          $install = Start-Process `
             -FilePath "msiexec.exe" `
-            -ArgumentList "/i `"$msi`" /qn /norestart" `
+            -ArgumentList @(
+              "/i"
+              $msi
+              "/qn"
+              "/norestart"
+            ) `
             -Wait `
             -PassThru
 
-          if ($process.ExitCode -ne 0) {
-            throw "Instalasi Tailscale gagal. Exit code: $($process.ExitCode)"
+          if ($install.ExitCode -ne 0) {
+            throw "Instalasi Tailscale gagal. Exit code: $($install.ExitCode)"
           }
 
-          $possiblePaths = @(
-            "$env:ProgramFiles\Tailscale\tailscale.exe",
-            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
-          )
+          $tsExe = Join-Path `
+            $env:ProgramFiles `
+            "Tailscale\tailscale.exe"
 
-          $tsExe = $null
-
-          foreach ($path in $possiblePaths) {
-            if (Test-Path $path) {
-              $tsExe = $path
-              break
-            }
-          }
-
-          if (-not $tsExe) {
-            $command = Get-Command `
+          if (-not (Test-Path $tsExe)) {
+            $cmd = Get-Command `
               "tailscale.exe" `
               -ErrorAction SilentlyContinue
 
-            if ($command) {
-              $tsExe = $command.Source
+            if ($cmd) {
+              $tsExe = $cmd.Source
             }
           }
 
-          if (-not $tsExe) {
+          if (-not $tsExe -or -not (Test-Path $tsExe)) {
             throw "tailscale.exe tidak ditemukan setelah instalasi."
           }
 
-          "TAILSCALE_EXE=$tsExe" | `
+          Write-Host "Using: $tsExe"
+
+          "TAILSCALE_EXE=$tsExe" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
 
-          Write-Host "Using: $tsExe"
-
           & $tsExe version
 
-      # =========================================================
-      # 3. ESTABLISH TAILSCALE CONNECTION
-      # =========================================================
+
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
@@ -227,7 +214,7 @@ jobs:
             throw "Tailscale executable tidak ditemukan."
           }
 
-          # Make sure Tailscale service is running
+          # Make sure service is running
           $service = Get-Service `
             -Name "Tailscale" `
             -ErrorAction SilentlyContinue
@@ -244,6 +231,7 @@ jobs:
             }
           }
 
+          Write-Host ""
           Write-Host "Tailscale version:"
           & $tsExe version
 
@@ -266,13 +254,15 @@ jobs:
             }
           }
 
+          Write-Host "tailscale up exit code: $exitCode"
+
           if ($exitCode -ne 0) {
             throw "Tailscale gagal terhubung. Periksa TAILSCALE_AUTH_KEY."
           }
 
           Write-Host "Tailscale up berhasil."
 
-          # Wait for IP
+          # Wait for Tailscale IP
           $tsIP = $null
 
           for ($i = 1; $i -le 60; $i++) {
@@ -302,15 +292,18 @@ jobs:
           }
 
           if (-not $tsIP) {
+
             Write-Host ""
-            Write-Host "Tailscale status:"
+            Write-Host "========== TAILSCALE STATUS =========="
+
             & $tsExe status
+
+            Write-Host "======================================="
 
             throw "Tailscale IP tidak berhasil diperoleh."
           }
 
-          # Save IP for following steps
-          "TAILSCALE_IP=$tsIP" | `
+          "TAILSCALE_IP=$tsIP" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
@@ -322,9 +315,7 @@ jobs:
           Write-Host "IP: $tsIP"
           Write-Host "======================================"
 
-      # =========================================================
-      # 4. VERIFY RDP ACCESSIBILITY
-      # =========================================================
+
       - name: Verify RDP Accessibility
         shell: pwsh
         run: |
@@ -334,6 +325,7 @@ jobs:
           Write-Host "       VERIFY RDP ACCESSIBILITY"
           Write-Host "======================================"
 
+          # Check RDP service
           $service = Get-Service `
             -Name "TermService" `
             -ErrorAction Stop
@@ -342,6 +334,7 @@ jobs:
             throw "TermService tidak berjalan."
           }
 
+          # Check registry
           $rdpReg = Get-ItemProperty `
             -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
             -Name "fDenyTSConnections" `
@@ -351,12 +344,12 @@ jobs:
             throw "RDP masih disabled."
           }
 
+          # Check Tailscale IP
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_IP)) {
             throw "TAILSCALE_IP tidak tersedia."
           }
 
-          Write-Host "Testing:"
-          Write-Host "$env:TAILSCALE_IP`:3389"
+          Write-Host "Testing $env:TAILSCALE_IP`:3389"
 
           $result = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
@@ -369,17 +362,15 @@ jobs:
 
           Write-Host ""
           Write-Host "======================================"
-          Write-Host "RDP ACCESSIBILITY: SUCCESS"
+          Write-Host "       RDP ACCESSIBILITY: SUCCESS"
           Write-Host "======================================"
           Write-Host "Address : $env:TAILSCALE_IP"
           Write-Host "Port    : 3389"
-          Write-Host "User    : RDP"
-          Write-Host "Password: [GitHub Secret RDP_PASSWORD]"
+          Write-Host "Username: RDP"
+          Write-Host "Password: [HIDDEN]"
           Write-Host "======================================"
 
-      # =========================================================
-      # 5. MAINTAIN CONNECTION
-      # =========================================================
+
       - name: Maintain Connection
         shell: pwsh
         run: |
@@ -396,13 +387,14 @@ jobs:
           Write-Host "======================================"
           Write-Host ""
 
-          # Keep the GitHub runner alive.
-          # Stop the workflow manually when finished.
+          Write-Host "RDP Active."
+          Write-Host "Keep this workflow running while you use the session."
+
           while ($true) {
 
             $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-            Write-Host "[$now] RDP Active - Tailscale IP: $env:TAILSCALE_IP"
+            Write-Host "[$now] RDP Active - $env:TAILSCALE_IP`:3389"
 
             Start-Sleep -Seconds 300
           }
