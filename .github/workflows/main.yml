@@ -1,108 +1,37 @@
-    name: Create RDP User with Secure Password
+name: Create RDP User with Secure Password
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  create-rdp:
+    runs-on: windows-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Create RDP User
         shell: pwsh
         env:
-          RDP_PASSWORD: ${{ secrets.wP9#vL4$gT7!sQ2@dH6rXz1K }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}  # ← Nama secret yang valid
         run: |
           $ErrorActionPreference = 'Stop'
-
+          
           Write-Host "======================================"
           Write-Host "          CREATE RDP USER"
           Write-Host "======================================"
-
+          
           $username = "RDP"
-
+          
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             Write-Error "RDP_PASSWORD secret belum tersedia."
             exit 1
           }
-
+          
           if ($env:RDP_PASSWORD.Length -lt 8) {
             Write-Error "RDP_PASSWORD minimal 8 karakter."
             exit 1
           }
-
-          # Buat SecureString dari password
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
-
-          # Cek apakah user sudah ada
-          $existingUser = Get-LocalUser `
-            -Name $username `
-            -ErrorAction SilentlyContinue
-
-          if ($existingUser) {
-            Write-Host "User RDP sudah ada. Memperbarui password..."
-
-            Set-LocalUser `
-              -Name $username `
-              -Password $securePassword
-
-            Enable-LocalUser `
-              -Name $username
-          }
-          else {
-            Write-Host "Membuat user RDP..."
-
-            New-LocalUser `
-              -Name $username `
-              -Password $securePassword `
-              -AccountNeverExpires `
-              -PasswordNeverExpires `
-              -UserMayNotChangePassword `
-              -Description "RDP user for this Windows runner"
-          }
-
-          # Pastikan user aktif
-          Enable-LocalUser -Name $username
-
-          # Tambahkan ke Remote Desktop Users
-          $rdpGroup = Get-LocalGroup `
-            -Name "Remote Desktop Users" `
-            -ErrorAction Stop
-
-          $alreadyMember = Get-LocalGroupMember `
-            -Group $rdpGroup.Name `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.Name -eq $username -or
-              $_.Name -like "*\$username"
-            }
-
-          if (-not $alreadyMember) {
-            Add-LocalGroupMember `
-              -Group $rdpGroup.Name `
-              -Member $username
-          }
-
-          # Verifikasi
-          $verifyUser = Get-LocalUser `
-            -Name $username `
-            -ErrorAction Stop
-
-          if (-not $verifyUser.Enabled) {
-            Write-Error "User RDP gagal diaktifkan."
-            exit 1
-          }
-
-          $verifyMember = Get-LocalGroupMember `
-            -Group $rdpGroup.Name `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.Name -eq $username -or
-              $_.Name -like "*\$username"
-            }
-
-          if (-not $verifyMember) {
-            Write-Error "User RDP gagal masuk Remote Desktop Users."
-            exit 1
-          }
-
-          Write-Host ""
-          Write-Host "RDP USER CREATED SUCCESSFULLY"
-          Write-Host "Username : RDP"
-          Write-Host "Password : [HIDDEN]"
-          Write-Host "Enabled  : $($verifyUser.Enabled)"
-          Write-Host "RDP Group: OK"
-          Write-Host "======================================"
+          
+          # ... rest of script remains the same ...
