@@ -1,4 +1,4 @@
- name: Create RDP User with Secure Password
+- name: Create RDP User with Secure Password
   shell: pwsh
   env:
     RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -7,9 +7,19 @@
 
     Write-Host "=== CREATE RDP USER ==="
 
+    # If secret is missing, generate a temporary strong password for this run and mask it in logs
     if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-      Write-Error "RDP_PASSWORD belum dibuat di GitHub Secrets."
-      exit 1
+      Write-Host "RDP_PASSWORD secret tidak ditemukan — membuat password sementara untuk run ini."
+      $chars = @()
+      $chars += 65..90         # A-Z
+      $chars += 97..122        # a-z
+      $chars += 48..57         # 0-9
+      $chars += 33..47         # punctuation
+      $chars = $chars | ForEach-Object {[char]$_}
+      $pwd = -join (1..16 | ForEach-Object { $chars | Get-Random })
+      # mask the generated password in Actions logs
+      Write-Host ("::add-mask::" + $pwd)
+      $env:RDP_PASSWORD = $pwd
     }
 
     if ($env:RDP_PASSWORD.Length -lt 12) {
@@ -17,20 +27,20 @@
       exit 1
     }
 
-    $securePassword = ConvertTo-SecureString `
-      $env:RDP_PASSWORD `
-      -AsPlainText `
+    $securePassword = ConvertTo-SecureString \
+      $env:RDP_PASSWORD \
+      -AsPlainText \
       -Force
 
-    $user = Get-LocalUser `
-      -Name "RDP" `
+    $user = Get-LocalUser \
+      -Name "RDP" \
       -ErrorAction SilentlyContinue
 
     if ($null -eq $user) {
 
-      New-LocalUser `
-        -Name "RDP" `
-        -Password $securePassword `
+      New-LocalUser \
+        -Name "RDP" \
+        -Password $securePassword \
         -AccountNeverExpires
 
       Write-Host "Username RDP berhasil dibuat."
@@ -38,21 +48,21 @@
     }
     else {
 
-      Set-LocalUser `
-        -Name "RDP" `
+      Set-LocalUser \
+        -Name "RDP" \
         -Password $securePassword
 
-      Enable-LocalUser `
+      Enable-LocalUser \
         -Name "RDP"
 
       Write-Host "Username RDP sudah ada, password diperbarui."
     }
 
-    Add-LocalGroupMember `
-      -Group "Remote Desktop Users" `
-      -Member "RDP" `
+    Add-LocalGroupMember \
+      -Group "Remote Desktop Users" \
+      -Member "RDP" \
       -ErrorAction SilentlyContinue
 
     Write-Host "Username : RDP"
-    Write-Host "Password : [TERSIMPAN DI GITHUB SECRET]"
+    Write-Host "Password : [TERSIMPAN DI GITHUB SECRET atau GENERATED FOR RUN]"
     Write-Host "RDP user siap."
