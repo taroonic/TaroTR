@@ -1,4 +1,4 @@
-      - name: Create RDP User with Secure Password
+       name: Create RDP User with Secure Password
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ password120 }}
