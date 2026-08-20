@@ -1,282 +1,58 @@
-name: RDP
-
-on:
-  workflow_dispatch:
-    inputs:
-      simulate_failure:
-        description: 'Set to "true" to simulate a controlled failure for testing'
-        required: false
-        default: 'false'
-
-jobs:
-  rdp:
-    runs-on: windows-latest
-    env:
-      SIMULATE_FAILURE: ${{ github.event.inputs.simulate_failure }}
-
-    steps:
-      - name: Configure Core RDP Settings
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "=== CONFIGURE RDP ==="
-
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0
-
-          Set-Service `
-            -Name 'TermService' `
-            -StartupType Automatic
-
-          Start-Service `
-            -Name 'TermService' `
-            -ErrorAction SilentlyContinue
-
-          Enable-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop' `
-            -ErrorAction SilentlyContinue
-
-          Write-Host "RDP configuration complete."
-
-      - name: Create RDP User with Secure Password
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "=== CREATE RDP USER ==="
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            Write-Error "RDP_PASSWORD secret belum tersedia."
-            exit 1
-          }
-
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
-
-          $user = Get-LocalUser `
-            -Name 'RDP' `
-            -ErrorAction SilentlyContinue
-
-          if ($user) {
-            Set-LocalUser `
-              -Name 'RDP' `
-              -Password $securePassword
-
-            Enable-LocalUser `
-              -Name 'RDP'
-
-            Write-Host "RDP user already exists."
-          }
-          else {
-            New-LocalUser `
-              -Name 'RDP' `
-              -Password $securePassword `
-              -AccountNeverExpires
-
-            Write-Host "RDP user created."
-          }
-
-          Add-LocalGroupMember `
-            -Group 'Remote Desktop Users' `
-            -Member 'RDP' `
-            -ErrorAction SilentlyContinue
-
-          Write-Host "RDP user configuration complete."
-
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "=== INSTALL TAILSCALE ==="
-
-          $msi = Join-Path $env:TEMP 'tailscale.msi'
-
-          Invoke-WebRequest `
-            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
-            -OutFile $msi
-
-          if (-not (Test-Path $msi)) {
-            Write-Error "Tailscale MSI gagal didownload."
-            exit 1
-          }
-
-          $process = Start-Process `
-            -FilePath 'msiexec.exe' `
-            -ArgumentList "/i `"$msi`" /qn /norestart" `
-            -Wait `
-            -PassThru
-
-          if ($process.ExitCode -ne 0) {
-            Write-Error "Instalasi Tailscale gagal. Exit code: $($process.ExitCode)"
-            exit 1
-          }
-
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $tsExe)) {
-            Write-Error "tailscale.exe tidak ditemukan."
-            exit 1
-          }
-
-          Write-Host "Using: $tsExe"
-
-          & $tsExe version
-
-      - name: Establish Tailscale Connection
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "=== ESTABLISH TAILSCALE ==="
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            Write-Error "TAILSCALE_AUTH_KEY secret belum tersedia."
-            exit 1
-          }
-
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $tsExe)) {
-            Write-Error "tailscale.exe tidak ditemukan."
-            exit 1
-          }
-
-          $service = Get-Service `
-            -Name 'Tailscale' `
-            -ErrorAction SilentlyContinue
-
-          if ($service -and $service.Status -ne 'Running') {
-            Start-Service -Name 'Tailscale'
-            Start-Sleep -Seconds 5
-          }
-
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-
-          & $tsExe up `
-            "--authkey=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=$hostname"
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Tailscale gagal terhubung. Periksa TAILSCALE_AUTH_KEY."
-            exit 1
-          }
-
-          $tsIP = $null
-
-          for ($i = 1; $i -le 30; $i++) {
-            Write-Host "Waiting for Tailscale IP: $i/30"
-
-            $output = & $tsExe ip -4 2>&1
-
-            if ($LASTEXITCODE -eq 0) {
-              foreach ($line in $output) {
-                $candidate = "$line".Trim()
-
-                if ($candidate -match '^100\.(\d{1,3}\.){2}\d{1,3}$') {
-                  $tsIP = $candidate
-                  break
-                }
-              }
-            }
-
-            if ($tsIP) {
-              break
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $tsIP) {
-            Write-Host "=== TAILSCALE STATUS ==="
-            & $tsExe status
-
-            Write-Error "Tailscale IP tidak diperoleh."
-            exit 1
-          }
-
-          "TAILSCALE_IP=$tsIP" |
-            Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-          Write-Host "Tailscale connected."
-          Write-Host "Tailscale IP: $tsIP"
-
-      - name: Verify RDP Accessibility
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "=== VERIFY RDP ACCESSIBILITY ==="
-
-          $service = Get-Service `
-            -Name 'TermService' `
-            -ErrorAction Stop
-
-          if ($service.Status -ne 'Running') {
-            Write-Error "TermService tidak berjalan."
-            exit 1
-          }
-
-          $reg = Get-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections'
-
-          if ($reg.fDenyTSConnections -ne 0) {
-            Write-Error "Remote Desktop masih disabled."
-            exit 1
-          }
-
-          $port = Test-NetConnection `
-            -ComputerName '127.0.0.1' `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
-
-          if (-not $port.TcpTestSucceeded) {
-            Write-Error "Port 3389 tidak aktif."
-            exit 1
-          }
-
-          Write-Host "RDP Service : OK"
-          Write-Host "RDP Registry: OK"
-          Write-Host "RDP Port    : OK"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-      - name: Simulate failure for testing
-        if: ${{ env.SIMULATE_FAILURE == 'true' }}
-        shell: pwsh
-        run: |
-          Write-Host "=== SIMULATE FAILURE ==="
-          Write-Error "Simulated failure triggered by SIMULATE_FAILURE=true"
-          exit 1
-
-      - name: Final Status
-        shell: pwsh
-        run: |
-          Write-Host "======================================"
-          Write-Host "             RDP STATUS"
-          Write-Host "======================================"
-
-          $service = Get-Service `
-            -Name 'TermService' `
-            -ErrorAction SilentlyContinue
-
-          if ($service) {
-            Write-Host "RDP Service : $($service.Status)"
-          }
-
-          Write-Host "RDP Port    : 3389"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "======================================"
-          Write-Host "RDP CHECK COMPLETE"
+- name: Create RDP User with Secure Password
+  shell: pwsh
+  env:
+    RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+
+    Write-Host "=== CREATE RDP USER ==="
+
+    if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+      Write-Error "RDP_PASSWORD belum dibuat di GitHub Secrets."
+      exit 1
+    }
+
+    if ($env:RDP_PASSWORD.Length -lt 12) {
+      Write-Error "Password harus minimal 12 karakter."
+      exit 1
+    }
+
+    $securePassword = ConvertTo-SecureString `
+      $env:RDP_PASSWORD `
+      -AsPlainText `
+      -Force
+
+    $user = Get-LocalUser `
+      -Name "RDP" `
+      -ErrorAction SilentlyContinue
+
+    if ($null -eq $user) {
+
+      New-LocalUser `
+        -Name "RDP" `
+        -Password $securePassword `
+        -AccountNeverExpires
+
+      Write-Host "Username RDP berhasil dibuat."
+
+    }
+    else {
+
+      Set-LocalUser `
+        -Name "RDP" `
+        -Password $securePassword
+
+      Enable-LocalUser `
+        -Name "RDP"
+
+      Write-Host "Username RDP sudah ada, password diperbarui."
+    }
+
+    Add-LocalGroupMember `
+      -Group "Remote Desktop Users" `
+      -Member "RDP" `
+      -ErrorAction SilentlyContinue
+
+    Write-Host "Username : RDP"
+    Write-Host "Password : [TERSIMPAN DI GITHUB SECRET]"
+    Write-Host "RDP user siap."
