@@ -1,7 +1,7 @@
     name: Create RDP User with Secure Password
         shell: pwsh
         env:
-          RDP_PASSWORD: ${{ password120 }}
+          RDP_PASSWORD: ${{ wP9#vL4$gT7!sQ2@dH6rXz1K }}
         run: |
           $ErrorActionPreference = 'Stop'
 
