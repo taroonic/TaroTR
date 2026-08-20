@@ -6,125 +6,109 @@ on:
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
 
     steps:
 
+      # ============================================================
+      # 1. CONFIGURE CORE RDP SETTINGS
+      # ============================================================
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "======================================"
+          Write-Host "     CONFIGURE CORE RDP SETTINGS"
+          Write-Host "======================================"
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          # Start Remote Desktop service
+          Set-Service -Name TermService -StartupType Automatic
+
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          # Enable built-in RDP firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Remote Desktop configured."
+
+      # ============================================================
+      # 2. CREATE RDP USER WITH SECURE PASSWORD
+      # ============================================================
       - name: Create RDP User with Secure Password
         shell: pwsh
         env:
+          RDP_USERNAME: RDP
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
 
           Write-Host "======================================"
-          Write-Host " CREATE RDP USER WITH SECURE PASSWORD"
+          Write-Host "     CREATE RDP USER"
           Write-Host "======================================"
 
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "RDP_PASSWORD secret belum dibuat."
+            Write-Error "RDP_PASSWORD secret belum dibuat."
+            exit 1
           }
 
-          if ($env:RDP_PASSWORD.Length -lt 8) {
-            throw "RDP_PASSWORD minimal 8 karakter."
-          }
-
-          # Enable RDP
-          $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
-
-          Set-ItemProperty `
-            -Path $rdpPath `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          # Enable RDP firewall
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop" `
-            -ErrorAction SilentlyContinue
-
-          # Start RDP service
-          $termService = Get-Service `
-            -Name "TermService" `
-            -ErrorAction Stop
-
-          if ($termService.Status -ne "Running") {
-            Start-Service -Name "TermService"
-          }
-
-          Set-Service `
-            -Name "TermService" `
-            -StartupType Automatic
-
-          # Password
           $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
             -Force
 
-          $username = "RDP"
-
-          # Create or update user
-          $existingUser = Get-LocalUser `
-            -Name $username `
+          $user = Get-LocalUser `
+            -Name $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
-          if ($existingUser) {
-            Write-Host "RDP user already exists."
+          if ($user) {
+            Write-Host "User RDP sudah ada. Memperbarui password."
 
             Set-LocalUser `
-              -Name $username `
-              -Password $securePassword
-
-            Enable-LocalUser `
-              -Name $username
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -ErrorAction Stop
           }
           else {
-            Write-Host "Creating RDP user..."
+            Write-Host "Membuat user RDP..."
 
             New-LocalUser `
-              -Name $username `
+              -Name $env:RDP_USERNAME `
               -Password $securePassword `
               -AccountNeverExpires `
               -PasswordNeverExpires `
               -UserMayNotChangePassword `
-              -Description "Temporary RDP account"
-
-            Enable-LocalUser `
-              -Name $username
+              -Description "RDP account" `
+              -ErrorAction Stop
           }
 
-          # Add user to Remote Desktop Users
-          $members = Get-LocalGroupMember `
+          Enable-LocalUser -Name $env:RDP_USERNAME
+
+          # Tambahkan ke Remote Desktop Users
+          Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
+            -Member $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
-          $alreadyMember = $members | Where-Object {
-            $_.Name -eq $username -or
-            $_.Name -like "*\$username"
-          }
-
-          if (-not $alreadyMember) {
-            Add-LocalGroupMember `
-              -Group "Remote Desktop Users" `
-              -Member $username
-          }
-
-          # Verify user
-          $verifyUser = Get-LocalUser `
-            -Name $username `
-            -ErrorAction Stop
-
-          if (-not $verifyUser.Enabled) {
-            throw "RDP user gagal diaktifkan."
-          }
-
-          Write-Host ""
-          Write-Host "RDP USER READY"
-          Write-Host "Username: RDP"
+          Write-Host "RDP user berhasil dikonfigurasi."
+          Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: [HIDDEN]"
-          Write-Host "Enabled : $($verifyUser.Enabled)"
 
-
+      # ============================================================
+      # 3. INSTALL TAILSCALE
+      # ============================================================
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -132,57 +116,46 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
 
           Write-Host "======================================"
-          Write-Host "          INSTALL TAILSCALE"
+          Write-Host "        INSTALL TAILSCALE"
           Write-Host "======================================"
 
           $msi = Join-Path $env:TEMP "tailscale.msi"
 
-          Write-Host "Downloading Tailscale..."
-
           Invoke-WebRequest `
             -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $msi
+            -OutFile $msi `
+            -UseBasicParsing
 
           if (-not (Test-Path $msi)) {
-            throw "Tailscale MSI gagal didownload."
+            Write-Error "Tailscale MSI gagal didownload."
+            exit 1
           }
 
-          Write-Host "Installing Tailscale..."
-
-          $install = Start-Process `
+          $process = Start-Process `
             -FilePath "msiexec.exe" `
-            -ArgumentList @(
-              "/i"
-              $msi
-              "/qn"
-              "/norestart"
-            ) `
+            -ArgumentList "/i `"$msi`" /qn /norestart" `
             -Wait `
             -PassThru
 
-          if ($install.ExitCode -ne 0) {
-            throw "Instalasi Tailscale gagal. Exit code: $($install.ExitCode)"
+          if ($process.ExitCode -ne 0) {
+            Write-Error "Instalasi Tailscale gagal. Exit code: $($process.ExitCode)"
+            exit 1
           }
 
-          $tsExe = Join-Path `
-            $env:ProgramFiles `
-            "Tailscale\tailscale.exe"
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (-not (Test-Path $tsExe)) {
-            $cmd = Get-Command `
-              "tailscale.exe" `
-              -ErrorAction SilentlyContinue
+            $cmd = Get-Command tailscale.exe -ErrorAction SilentlyContinue
 
             if ($cmd) {
               $tsExe = $cmd.Source
             }
           }
 
-          if (-not $tsExe -or -not (Test-Path $tsExe)) {
-            throw "tailscale.exe tidak ditemukan setelah instalasi."
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "tailscale.exe tidak ditemukan."
+            exit 1
           }
-
-          Write-Host "Using: $tsExe"
 
           "TAILSCALE_EXE=$tsExe" |
             Out-File `
@@ -190,9 +163,14 @@ jobs:
               -Encoding utf8 `
               -Append
 
+          Write-Host "Tailscale installed:"
+          Write-Host $tsExe
+
           & $tsExe version
 
-
+      # ============================================================
+      # 4. ESTABLISH TAILSCALE CONNECTION
+      # ============================================================
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
@@ -201,80 +179,53 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           Write-Host "======================================"
-          Write-Host "      ESTABLISH TAILSCALE CONNECTION"
+          Write-Host "    ESTABLISH TAILSCALE CONNECTION"
           Write-Host "======================================"
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY secret belum dibuat."
+            Write-Error "TAILSCALE_AUTH_KEY secret belum dibuat."
+            exit 1
           }
 
-          $tsExe = $env:TAILSCALE_EXE
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          if (-not $tsExe -or -not (Test-Path $tsExe)) {
-            throw "Tailscale executable tidak ditemukan."
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "tailscale.exe tidak ditemukan."
+            exit 1
           }
 
-          # Make sure service is running
           $service = Get-Service `
-            -Name "Tailscale" `
+            -Name Tailscale `
             -ErrorAction SilentlyContinue
 
-          if ($service) {
-            Write-Host "Tailscale service: $($service.Status)"
-
-            if ($service.Status -ne "Running") {
-              Start-Service `
-                -Name "Tailscale" `
-                -ErrorAction Stop
-
-              Start-Sleep -Seconds 5
-            }
+          if ($service -and $service.Status -ne "Running") {
+            Start-Service -Name Tailscale
+            Start-Sleep -Seconds 5
           }
-
-          Write-Host ""
-          Write-Host "Tailscale version:"
-          & $tsExe version
 
           $hostname = "gh-rdp-$env:GITHUB_RUN_ID"
 
-          Write-Host ""
-          Write-Host "Connecting..."
+          Write-Host "Connecting to Tailscale..."
 
-          $output = & $tsExe up `
-            "--auth-key=$env:TAILSCALE_AUTH_KEY" `
+          & $tsExe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
             "--hostname=$hostname" `
-            "--accept-dns=false" `
-            2>&1
+            "--accept-dns=false"
 
-          $exitCode = $LASTEXITCODE
-
-          if ($output) {
-            $output | ForEach-Object {
-              Write-Host $_
-            }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Tailscale gagal terhubung."
+            exit 1
           }
 
-          Write-Host "tailscale up exit code: $exitCode"
-
-          if ($exitCode -ne 0) {
-            throw "Tailscale gagal terhubung. Periksa TAILSCALE_AUTH_KEY."
-          }
-
-          Write-Host "Tailscale up berhasil."
-
-          # Wait for Tailscale IP
           $tsIP = $null
 
           for ($i = 1; $i -le 60; $i++) {
+            Write-Host "Waiting for Tailscale IP... $i/60"
 
-            Write-Host "Waiting for Tailscale IP: $i/60"
+            $output = & $tsExe ip -4 2>$null
 
-            $ipOutput = & $tsExe ip -4 2>$null
-
-            if ($LASTEXITCODE -eq 0 -and $ipOutput) {
-
-              foreach ($line in $ipOutput) {
-
+            if ($LASTEXITCODE -eq 0 -and $output) {
+              foreach ($line in $output) {
                 $candidate = "$line".Trim()
 
                 if ($candidate -match '^100\.(\d{1,3}\.){2}\d{1,3}$') {
@@ -292,15 +243,12 @@ jobs:
           }
 
           if (-not $tsIP) {
-
-            Write-Host ""
             Write-Host "========== TAILSCALE STATUS =========="
-
             & $tsExe status
+            Write-Host "======================================"
 
-            Write-Host "======================================="
-
-            throw "Tailscale IP tidak berhasil diperoleh."
+            Write-Error "Tailscale IP tidak berhasil diperoleh."
+            exit 1
           }
 
           "TAILSCALE_IP=$tsIP" |
@@ -310,91 +258,116 @@ jobs:
               -Append
 
           Write-Host ""
-          Write-Host "======================================"
-          Write-Host "Tailscale connected successfully."
-          Write-Host "IP: $tsIP"
-          Write-Host "======================================"
+          Write-Host "Tailscale connected."
+          Write-Host "Tailscale IP: $tsIP"
 
-
+      # ============================================================
+      # 5. VERIFY RDP ACCESSIBILITY
+      # ============================================================
       - name: Verify RDP Accessibility
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
           Write-Host "======================================"
-          Write-Host "       VERIFY RDP ACCESSIBILITY"
+          Write-Host "      VERIFY RDP ACCESSIBILITY"
           Write-Host "======================================"
 
-          # Check RDP service
-          $service = Get-Service `
-            -Name "TermService" `
-            -ErrorAction Stop
-
-          if ($service.Status -ne "Running") {
-            throw "TermService tidak berjalan."
-          }
-
-          # Check registry
-          $rdpReg = Get-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -ErrorAction Stop
-
-          if ($rdpReg.fDenyTSConnections -ne 0) {
-            throw "RDP masih disabled."
-          }
-
-          # Check Tailscale IP
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_IP)) {
-            throw "TAILSCALE_IP tidak tersedia."
+            Write-Error "TAILSCALE_IP tidak tersedia."
+            exit 1
           }
 
-          Write-Host "Testing $env:TAILSCALE_IP`:3389"
+          $service = Get-Service `
+            -Name TermService `
+            -ErrorAction SilentlyContinue
 
-          $result = Test-NetConnection `
+          if (-not $service -or $service.Status -ne "Running") {
+            Write-Error "Remote Desktop service tidak berjalan."
+            exit 1
+          }
+
+          $reg = Get-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections `
+            -ErrorAction Stop
+
+          if ($reg.fDenyTSConnections -ne 0) {
+            Write-Error "Remote Desktop masih disabled."
+            exit 1
+          }
+
+          Write-Host "Testing local RDP port..."
+
+          $local = Test-NetConnection `
+            -ComputerName "127.0.0.1" `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $local.TcpTestSucceeded) {
+            Write-Error "Local RDP port 3389 tidak terbuka."
+            exit 1
+          }
+
+          Write-Host "Testing Tailscale RDP port..."
+          Write-Host "$env:TAILSCALE_IP`:3389"
+
+          $remote = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
             -Port 3389 `
             -WarningAction SilentlyContinue
 
-          if (-not $result.TcpTestSucceeded) {
-            throw "TCP connection ke RDP port 3389 gagal."
+          if (-not $remote.TcpTestSucceeded) {
+            Write-Error "RDP melalui Tailscale tidak dapat diakses."
+            exit 1
           }
 
           Write-Host ""
+          Write-Host "RDP accessibility check PASSED."
+
+      # ============================================================
+      # 6. FINAL STATUS
+      # ============================================================
+      - name: Final Status
+        shell: pwsh
+        run: |
+          Write-Host ""
           Write-Host "======================================"
-          Write-Host "       RDP ACCESSIBILITY: SUCCESS"
-          Write-Host "======================================"
-          Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host "Port    : 3389"
-          Write-Host "Username: RDP"
-          Write-Host "Password: [HIDDEN]"
+          Write-Host "             RDP STATUS"
           Write-Host "======================================"
 
+          $service = Get-Service `
+            -Name TermService `
+            -ErrorAction SilentlyContinue
 
+          Write-Host "RDP Service : $($service.Status)"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "RDP Port    : 3389"
+          Write-Host "Username    : RDP"
+          Write-Host "Password    : [HIDDEN]"
+
+          Write-Host "======================================"
+          Write-Host "RDP CHECK COMPLETE"
+
+      # ============================================================
+      # 7. MAINTAIN CONNECTION
+      # ============================================================
       - name: Maintain Connection
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
-
           Write-Host ""
           Write-Host "======================================"
           Write-Host "          RDP ACCESS ACTIVE"
           Write-Host "======================================"
           Write-Host "Address : $env:TAILSCALE_IP"
           Write-Host "Port    : 3389"
-          Write-Host "Username: RDP"
+          Write-Host "User    : RDP"
           Write-Host "Password: [HIDDEN]"
           Write-Host "======================================"
           Write-Host ""
-
-          Write-Host "RDP Active."
-          Write-Host "Keep this workflow running while you use the session."
+          Write-Host "Runner akan tetap aktif sampai workflow dibatalkan."
 
           while ($true) {
-
-            $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-
-            Write-Host "[$now] RDP Active - $env:TAILSCALE_IP`:3389"
-
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active"
             Start-Sleep -Seconds 300
           }
