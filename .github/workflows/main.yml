@@ -2,10 +2,17 @@ name: RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: 'Set to "true" to simulate a controlled failure for testing'
+        required: false
+        default: 'false'
 
 jobs:
   rdp:
     runs-on: windows-latest
+    env:
+      SIMULATE_FAILURE: ${{ github.event.inputs.simulate_failure }}
 
     steps:
       - name: Configure Core RDP Settings
@@ -245,6 +252,14 @@ jobs:
           Write-Host "RDP Registry: OK"
           Write-Host "RDP Port    : OK"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+      - name: Simulate failure for testing
+        if: ${{ env.SIMULATE_FAILURE == 'true' }}
+        shell: pwsh
+        run: |
+          Write-Host "=== SIMULATE FAILURE ==="
+          Write-Error "Simulated failure triggered by SIMULATE_FAILURE=true"
+          exit 1
 
       - name: Final Status
         shell: pwsh
